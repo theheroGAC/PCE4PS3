@@ -1,0 +1,6 @@
+*.o
+*.elf
+*.self
+build/
+pkg_build/
+pkgbuild/
