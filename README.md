@@ -1,4 +1,4 @@
-# PCE-PS3 (v1.0.0)
+# PCE-PS3 (v1.0.1)
 
 Port of **Hu-Go!** PC Engine / TurboGrafx-16 / SuperGrafx / CD-ROM2 for the **PlayStation 3** (PS3) using the PSL1GHT SDK.
 
