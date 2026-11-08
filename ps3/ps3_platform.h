@@ -14,6 +14,7 @@
 #define PS3_BIOS_DIR        "/dev_hdd0/pce4ps3/bios"
 #define PS3_SAVES_DIR       "/dev_hdd0/pce4ps3/saves"
 #define PS3_BRAM_DIR        "/dev_hdd0/pce4ps3/bram"
+#define PS3_SCREENSHOTS_DIR "/dev_hdd0/pce4ps3/screenshots"
 #define PS3_CONFIG_PATH     "/dev_hdd0/pce4ps3/hugo.ini"
 #define PS3_LOG_PATH        "/dev_hdd0/pce4ps3/hugo.log"
 
@@ -59,7 +60,15 @@ enum {
 enum {
     PS3_FILTER_NEAREST = 0,
     PS3_FILTER_LINEAR,
+    PS3_FILTER_ANISOTROPIC,
     PS3_FILTER_COUNT
+};
+
+enum {
+    PS3_PAD_AUTO = 0,
+    PS3_PAD_6BUTTON,
+    PS3_PAD_2BUTTON,
+    PS3_PAD_MODE_COUNT
 };
 
 enum {
@@ -84,12 +93,14 @@ typedef struct {
     int turbo_rate;
     int audio_volume;
     int show_fps;
+    int six_button_pad;
     char bios_name[256];
     char last_rom_dir[512];
 } ps3_config_t;
 
 extern ps3_config_t g_cfg;
 extern volatile int g_xmb_menu_open;
+extern int ROM_size;
 
 void ps3_log_init(void);
 void ps3_log_close(void);
@@ -113,6 +124,8 @@ void ps3_video_render_game_to_fb(int src_w, int src_h);
 void ps3_video_present_game_frame(int src_w, int src_h);
 void ps3_video_capture_thumb(uint32_t *dst_argb, int dst_w, int dst_h);
 void ps3_video_toast(const char *msg, int frames);
+void ps3_take_screenshot(void);
+extern volatile int g_take_screenshot_pending;
 
 void ps3_video_clear(uint8_t r, uint8_t g, uint8_t b);
 void ps3_video_present(void);
@@ -158,7 +171,7 @@ void ps3_audio_shutdown(void);
 void ps3_audio_pause(int paused);
 
 uint32_t ps3_pad_poll_menu(uint32_t *out_pressed);
-void     ps3_pad_poll_game(unsigned char joy_out[5]);
+void     ps3_pad_poll_game(unsigned char joy_out[10]);
 int      ps3_pad_ingame_combo_triggered(void);
 
 void ps3_frame_hook(void);
@@ -168,6 +181,7 @@ void osd_shut_machine(void);
 extern volatile int g_emu_quit_to_browser;
 extern volatile int g_app_should_quit;
 void ps3_return_to_xmb(void);
+void ps3_check_sysutil(void);
 
 void ps3_bram_load(const char *rom_base);
 void ps3_bram_save(const char *rom_base);

@@ -18,6 +18,7 @@ extern unsigned char *osd_gfx_buffer;
 extern unsigned char *XBuf;
 
 volatile int g_xmb_menu_open = 0;
+volatile int g_take_screenshot_pending = 0;
 
 static SDL_Window   *g_window     = NULL;
 static SDL_Renderer *g_renderer   = NULL;
@@ -225,8 +226,6 @@ int ps3_video_init(void)
         ps3_log("SDL_Init(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
         return -1;
     }
-    sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT0);
-    sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT1);
 
     if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
         g_out_w = dm.w;
@@ -292,8 +291,10 @@ void ps3_video_shutdown(void)
 void ps3_video_apply_filter(void)
 {
     if (!g_renderer) return;
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
-                (g_cfg.filter == PS3_FILTER_LINEAR) ? "linear" : "nearest");
+    const char *quality = "nearest";
+    if (g_cfg.filter == PS3_FILTER_LINEAR) quality = "linear";
+    else if (g_cfg.filter == PS3_FILTER_ANISOTROPIC) quality = "best";
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, quality);
     if (g_screen_tex) {
         SDL_DestroyTexture(g_screen_tex);
         g_screen_tex = NULL;
@@ -343,6 +344,7 @@ void ps3_video_present(void)
     SDL_UpdateTexture(g_screen_tex, NULL, g_screen_fb, PS3_SCREEN_W * (int)sizeof(uint32_t));
     SDL_RenderCopy(g_renderer, g_screen_tex, NULL, &dst);
     SDL_RenderPresent(g_renderer);
+    ps3_check_sysutil();
 }
 
 void ps3_draw_rect(int x, int y, int w, int h, uint32_t argb)
@@ -1133,4 +1135,115 @@ void ps3_video_present_game_frame(int src_w, int src_h)
     }
 
     ps3_video_present();
+}
+
+void ps3_take_screenshot(void)
+{
+    if (!g_screen_fb) return;
+    mkdir("/dev_hdd0/pce4ps3", 0777);
+    mkdir("/dev_hdd0/pce4ps3/screenshots", 0777);
+    char path[256];
+    int idx = 1;
+    for (; idx < 10000; idx++) {
+        snprintf(path, sizeof(path), "/dev_hdd0/pce4ps3/screenshots/pce_snap_%04d.bmp", idx);
+        FILE *tf = fopen(path, "rb");
+        if (!tf) break;
+        fclose(tf);
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        ps3_video_toast("Screenshot Failed", 90);
+        return;
+    }
+    int w = PS3_SCREEN_W;
+    int h = PS3_SCREEN_H;
+
+    uint32_t *capture_fb = g_screen_fb;
+    uint32_t *clean_fb = NULL;
+
+    unsigned char *src_base = osd_gfx_buffer ? osd_gfx_buffer
+                                             : (XBuf ? (XBuf + 32 + 64 * XBUF_WIDTH) : NULL);
+    if (src_base) {
+        clean_fb = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+        if (clean_fb) {
+            uint32_t *saved_fb = g_screen_fb;
+            g_screen_fb = clean_fb;
+            int gw = g_last_game_w > 0 ? g_last_game_w : 256;
+            int gh = g_last_game_h > 0 ? g_last_game_h : 224;
+            ps3_video_render_game_to_fb(gw, gh);
+            g_screen_fb = saved_fb;
+            capture_fb = clean_fb;
+        }
+    }
+
+    unsigned char hdr[54];
+    memset(hdr, 0, 54);
+    hdr[0] = 'B';
+    hdr[1] = 'M';
+    uint32_t img_size = (uint32_t)w * (uint32_t)h * 3u;
+    uint32_t file_size = 54u + img_size;
+    hdr[2] = (unsigned char)(file_size & 0xFFu);
+    hdr[3] = (unsigned char)((file_size >> 8) & 0xFFu);
+    hdr[4] = (unsigned char)((file_size >> 16) & 0xFFu);
+    hdr[5] = (unsigned char)((file_size >> 24) & 0xFFu);
+    hdr[10] = 54;
+    hdr[14] = 40;
+    hdr[18] = (unsigned char)(w & 0xFF);
+    hdr[19] = (unsigned char)((w >> 8) & 0xFF);
+    hdr[20] = (unsigned char)((w >> 16) & 0xFF);
+    hdr[21] = (unsigned char)((w >> 24) & 0xFF);
+    hdr[22] = (unsigned char)(h & 0xFF);
+    hdr[23] = (unsigned char)((h >> 8) & 0xFF);
+    hdr[24] = (unsigned char)((h >> 16) & 0xFF);
+    hdr[25] = (unsigned char)((h >> 24) & 0xFF);
+    hdr[26] = 1;
+    hdr[28] = 24;
+    hdr[34] = (unsigned char)(img_size & 0xFFu);
+    hdr[35] = (unsigned char)((img_size >> 8) & 0xFFu);
+    hdr[36] = (unsigned char)((img_size >> 16) & 0xFFu);
+    hdr[37] = (unsigned char)((img_size >> 24) & 0xFFu);
+    fwrite(hdr, 1, 54, f);
+    unsigned char row[1280 * 3];
+    for (int y = h - 1; y >= 0; y--) {
+        const uint32_t *src_row = &capture_fb[y * w];
+        for (int x = 0; x < w; x++) {
+            uint32_t c = src_row[x];
+            row[x * 3 + 0] = (unsigned char)(c & 0xFFu);
+            row[x * 3 + 1] = (unsigned char)((c >> 8) & 0xFFu);
+            row[x * 3 + 2] = (unsigned char)((c >> 16) & 0xFFu);
+        }
+        fwrite(row, 1, sizeof(row), f);
+    }
+    fclose(f);
+
+    for (int u = 0; u < 8; u++) {
+        char udir[256];
+        snprintf(udir, sizeof(udir), "/dev_usb00%d/pce4ps3/screenshots", u);
+        mkdir(udir, 0777);
+        char upath[256];
+        snprintf(upath, sizeof(upath), "/dev_usb00%d/pce4ps3/screenshots/pce_snap_%04d.bmp", u, idx);
+        FILE *uf = fopen(upath, "wb");
+        if (uf) {
+            fwrite(hdr, 1, 54, uf);
+            for (int y = h - 1; y >= 0; y--) {
+                const uint32_t *src_row = &capture_fb[y * w];
+                for (int x = 0; x < w; x++) {
+                    uint32_t c = src_row[x];
+                    row[x * 3 + 0] = (unsigned char)(c & 0xFFu);
+                    row[x * 3 + 1] = (unsigned char)((c >> 8) & 0xFFu);
+                    row[x * 3 + 2] = (unsigned char)((c >> 16) & 0xFFu);
+                }
+                fwrite(row, 1, sizeof(row), uf);
+            }
+            fclose(uf);
+            break;
+        }
+    }
+
+    if (clean_fb) {
+        free(clean_fb);
+    }
+    char toast[64];
+    snprintf(toast, sizeof(toast), "Screenshot snap_%04d saved", idx);
+    ps3_video_toast(toast, 120);
 }

@@ -66,8 +66,8 @@ static void generate_stereo_block(float *dst_interleaved, size_t frames)
         int32_t sum_r = (int8_t)sbuf[0][ri] + (int8_t)sbuf[1][ri] + (int8_t)sbuf[2][ri] +
                         (int8_t)sbuf[3][ri] + (int8_t)sbuf[4][ri] + (int8_t)sbuf[5][ri] +
                         (int8_t)adpcmbuf[ri];
-        int32_t sl = sum_l * (lvol + 1) * 16;
-        int32_t sr = sum_r * (rvol + 1) * 16;
+        int32_t sl = (sum_l * (lvol + 1) * 5) / 2;
+        int32_t sr = (sum_r * (rvol + 1) * 5) / 2;
         if (sl >  32767) sl =  32767;
         if (sl < -32768) sl = -32768;
         if (sr >  32767) sr =  32767;

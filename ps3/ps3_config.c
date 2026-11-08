@@ -17,6 +17,7 @@ void ps3_config_defaults(void)
     g_cfg.turbo_rate   = 3;
     g_cfg.audio_volume = 100;
     g_cfg.show_fps     = 0;
+    g_cfg.six_button_pad = PS3_PAD_AUTO;
     snprintf(g_cfg.bios_name, sizeof(g_cfg.bios_name), "syscard3.pce");
     snprintf(g_cfg.last_rom_dir, sizeof(g_cfg.last_rom_dir), "%s", PS3_ROMS_DIR);
 }
@@ -55,8 +56,12 @@ void ps3_config_load(void)
         else if (!strcasecmp(key, "scanlines"))    g_cfg.scanlines    = atoi(val) ? 1 : 0;
         else if (!strcasecmp(key, "swap_i_ii"))    g_cfg.swap_i_ii    = atoi(val) ? 1 : 0;
         else if (!strcasecmp(key, "turbo_rate"))   g_cfg.turbo_rate   = atoi(val);
-        else if (!strcasecmp(key, "audio_volume")) g_cfg.audio_volume = atoi(val);
-        else if (!strcasecmp(key, "show_fps"))     g_cfg.show_fps     = atoi(val) ? 1 : 0;
+        else if (!strcasecmp(key, "audio_volume"))   g_cfg.audio_volume   = atoi(val);
+        else if (!strcasecmp(key, "show_fps"))       g_cfg.show_fps       = atoi(val) ? 1 : 0;
+        else if (!strcasecmp(key, "six_button_pad")) {
+            int p = atoi(val);
+            g_cfg.six_button_pad = (p >= 0 && p < PS3_PAD_MODE_COUNT) ? p : PS3_PAD_AUTO;
+        }
         else if (!strcasecmp(key, "bios_name"))    snprintf(g_cfg.bios_name, sizeof(g_cfg.bios_name), "%s", val);
         else if (!strcasecmp(key, "last_rom_dir")) snprintf(g_cfg.last_rom_dir, sizeof(g_cfg.last_rom_dir), "%s", val);
     }
@@ -77,8 +82,9 @@ void ps3_config_save(void)
     fprintf(f, "scanlines=%d\n",    g_cfg.scanlines);
     fprintf(f, "swap_i_ii=%d\n",    g_cfg.swap_i_ii);
     fprintf(f, "turbo_rate=%d\n",   g_cfg.turbo_rate);
-    fprintf(f, "audio_volume=%d\n", g_cfg.audio_volume);
-    fprintf(f, "show_fps=%d\n",     g_cfg.show_fps);
+    fprintf(f, "audio_volume=%d\n",   g_cfg.audio_volume);
+    fprintf(f, "show_fps=%d\n",       g_cfg.show_fps);
+    fprintf(f, "six_button_pad=%d\n", g_cfg.six_button_pad);
     fprintf(f, "bios_name=%s\n",    g_cfg.bios_name);
     fprintf(f, "last_rom_dir=%s\n", g_cfg.last_rom_dir);
     fclose(f);

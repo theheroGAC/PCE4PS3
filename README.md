@@ -49,16 +49,29 @@ Supported media file formats:
     - **4:3 Standard** (Classic CRT television ratio with crisp pillarboxes)
     - **Pixel-Perfect** (Integer scaling matching native HuC6270 display registers)
     - **16:9 Widescreen** (Full 1080p widescreen fill)
-  - Video scaling filters: **Nearest Crisp** (sharp retro pixels) and **Bilinear Smooth**.
+  - Video scaling filters: **Nearest Crisp** (sharp retro pixels), **Bilinear Smooth**, and **Anisotropic / Sharp**.
   - CRT Scanlines overlay simulation option.
   - Real-time on-screen FPS counter.
+  - **In-Game Screenshot Capture**: Instant one-click screenshot capture via the In-Game Quick Menu, saving uncompressed 24-bit full-resolution BMP images to `/dev_hdd0/pce4ps3/screenshots/` with on-screen notification.
 
-- **DualShock 3 Gamepad & Multitap Support**:
+- **DualShock 3 Gamepad & Avenue Pad 6 (6-Button) Support**:
+  - Full support for the official NEC **Avenue Pad 6** 6-button controller protocol with 4-scan state machine, auto-detected for all fighting games (*Street Fighter II'*, *Fatal Fury*, *Garou Densetsu*, *Art of Fighting*, *World Heroes*, *Flash Hiders*, *Advanced V.G.*, *Kabuki Ittouryoudan*, *Martial Champion*, *Strip Fighter II*, *Asuka 120%*, etc.) and toggleable in Settings and Quick Menu (`Auto (Fighting Games)`, `6-Button Arcade`, `2-Button Standard`).
+  - Authentic 6-button arcade layout on DualShock 3:
+    - **Square**: Button IV (Light Punch)
+    - **Triangle**: Button V (Medium Punch)
+    - **R1** (or L1): Button VI (Heavy Punch)
+    - **Cross**: Button I (Light Kick)
+    - **Circle**: Button II (Medium Kick)
+    - **R2**: Button III (Heavy Kick)
   - Active-high polling logic ensuring smooth, continuous character movement without dropped frames or stuttering.
-  - Configurable button layout: swap Button I / Button II between Cross and Circle or Cross and Square.
+  - Configurable 2-button layout: swap Button I / Button II between Cross and Circle or Cross and Square.
   - Independent hardware Turbo Fire on L1 / R1 with selectable frequencies (15 Hz, 20 Hz, 30 Hz, 60 Hz).
   - Up to 5 simultaneous controllers supported for multiplayer games (Bomberman, Dungeon Explorer, etc.).
   - Seamless in-game Quick Menu triggered with **L2 + R2**, **L3 + R3**, or **SELECT + START**.
+
+- **Street Fighter II' & Large HuCard Bankswitching Support**:
+  - Full hardware emulation of Capcom's custom 20 Mbit (2.5 MB) bankswitching mapper (`0x1FF0`–`0x1FF3` bank registers), eliminating all character portrait tile corruptions and graphic errors in *Street Fighter II': Champion Edition*.
+  - Balanced audio summing preventing digital multi-channel distortion and loud clipping.
 
 - **Modern Multi-Tab User Interface**:
   - **Library Tab**: Automatic recursive scanner displaying games found across internal HDD and connected USB drives with clean categorization badges (`[PCE]`, `[SGX]`, `[CD]`, `[ZIP]`).
@@ -117,6 +130,7 @@ At first launch, the emulator creates the necessary directory tree on the intern
   ├── roms/        PC Engine ROMs (.pce, .sgx, .zip, .cue, .iso)
   ├── bios/        Super CD-ROM2 System Card (syscard3.pce)
   ├── saves/       10-slot save states (.s00-.s09) and thumbnail images (.thm)
+  ├── screenshots/ Uncompressed 24-bit BMP screenshots (pce_snap_0001.bmp)
   ├── bram/        Battery-backed 8KB Backup RAM per game (.brm)
   ├── hugo.ini     Persistent configuration file
   └── bootlog.txt  Diagnostic log output

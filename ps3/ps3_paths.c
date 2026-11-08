@@ -15,6 +15,7 @@ void ps3_ensure_directories(void)
     mkdir_ignore(PS3_BIOS_DIR);
     mkdir_ignore(PS3_SAVES_DIR);
     mkdir_ignore(PS3_BRAM_DIR);
+    mkdir_ignore(PS3_SCREENSHOTS_DIR);
 }
 
 static int file_exists(const char *p)

@@ -190,6 +190,11 @@ static void osd_gfx_put_image_normal(void)
         osd_gfx_buffer = XBuf + 32 + 64 * XBUF_WIDTH;
     }
     ps3_video_present_game_frame(w, h);
+    ps3_check_sysutil();
+    if (g_take_screenshot_pending) {
+        g_take_screenshot_pending = 0;
+        ps3_take_screenshot();
+    }
     ps3_frame_hook();
 }
 
@@ -204,6 +209,7 @@ void osd_shutdown_input(void)
 
 int osd_keyboard(void)
 {
+    ps3_check_sysutil();
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
@@ -215,9 +221,10 @@ int osd_keyboard(void)
         return 1;
     }
 
-    unsigned char pads[5];
+    unsigned char pads[10];
+    memset(pads, 0, sizeof(pads));
     ps3_pad_poll_game(pads);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 10; i++) {
         io.JOY[i] = pads[i];
     }
 
