@@ -39,13 +39,8 @@ int ps3_find_syscard(char *out_path, size_t cap)
 
     const char *dirs[] = {
         PS3_BIOS_DIR,
-        PS3_ROMS_DIR,
         PS3_DATA_ROOT,
-        "/dev_usb000/pce4ps3/bios",
-        "/dev_usb000/roms/pce",
-        "/dev_usb000/pce",
-        "/dev_usb001/pce4ps3/bios",
-        "/dev_usb001/roms/pce",
+        PS3_ROMS_DIR,
         NULL
     };
 
@@ -53,6 +48,18 @@ int ps3_find_syscard(char *out_path, size_t cap)
     for (int d = 0; dirs[d]; d++) {
         for (int n = 0; names[n]; n++) {
             snprintf(candidate, sizeof(candidate), "%s/%s", dirs[d], names[n]);
+            if (file_exists(candidate)) {
+                snprintf(out_path, cap, "%s", candidate);
+                return 1;
+            }
+        }
+    }
+
+    if (g_active_rom_path[0] && strncmp(g_active_rom_path, "/dev_usb", 8) == 0) {
+        char usb_dir[64];
+        snprintf(usb_dir, sizeof(usb_dir), "%.11s/pce4ps3/bios", g_active_rom_path);
+        for (int n = 0; names[n]; n++) {
+            snprintf(candidate, sizeof(candidate), "%s/%s", usb_dir, names[n]);
             if (file_exists(candidate)) {
                 snprintf(out_path, cap, "%s", candidate);
                 return 1;

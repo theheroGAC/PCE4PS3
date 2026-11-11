@@ -13,6 +13,8 @@
 #include <io/pad.h>
 #include <sysutil/sysutil.h>
 #include <sys/process.h>
+#include <sys/time.h>
+#include <sys/systime.h>
 
 #include "pce.h"
 #include "hard_pce.h"
@@ -21,13 +23,59 @@
 
 SYS_PROCESS_PARAM(1001, 0x100000);
 
+static inline uint64_t ps3_now_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+static uint64_t s_pacer_target_us = 0;
+
 volatile int g_emu_quit_to_browser = 0;
 volatile int g_app_should_quit     = 0;
+volatile int g_fast_forward_active = 0;
 
-static char g_rom_base[256]      = "default";
-static char g_active_rom_path[512] = "";
-static int  g_quick_slot         = 0;
-static int  g_game_loaded        = 0;
+static int      s_ff_toggled      = 0;
+static int      s_ff_prev         = 0;
+static int      s_ff_wait_release = 0;
+static int      s_ff_had_combo    = 0;
+static uint64_t s_ff_press_us     = 0;
+
+static void reset_fast_forward_state(int wait_release)
+{
+    s_ff_toggled          = 0;
+    s_ff_prev             = 0;
+    s_ff_wait_release     = wait_release;
+    s_ff_had_combo        = 0;
+    s_ff_press_us         = 0;
+    g_fast_forward_active = 0;
+    s_pacer_target_us     = 0;
+}
+
+static int btn_id_to_icon(int btn_id)
+{
+    switch (btn_id) {
+        case PS3_BTN_CROSS:    return BTN_ICON_CROSS;
+        case PS3_BTN_CIRCLE:   return BTN_ICON_CIRCLE;
+        case PS3_BTN_SQUARE:   return BTN_ICON_SQUARE;
+        case PS3_BTN_TRIANGLE: return BTN_ICON_TRIANGLE;
+        case PS3_BTN_L1:       return BTN_ICON_L1;
+        case PS3_BTN_R1:       return BTN_ICON_R1;
+        case PS3_BTN_L2:       return BTN_ICON_L2;
+        case PS3_BTN_R2:       return BTN_ICON_R2;
+        case PS3_BTN_L3:       return BTN_ICON_L3;
+        case PS3_BTN_R3:       return BTN_ICON_R3;
+        case PS3_BTN_START:    return BTN_ICON_START;
+        case PS3_BTN_SELECT:   return BTN_ICON_SELECT;
+        default:               return BTN_ICON_L3;
+    }
+}
+
+char g_rom_base[256]               = "default";
+char g_active_rom_path[512]        = "";
+static int  g_quick_slot           = 0;
+static int  g_game_loaded          = 0;
 
 static uint32_t g_slot_thumb_argb[PS3_THUMB_W * PS3_THUMB_H];
 static int      g_slot_thumb_loaded_slot = -1;
@@ -359,6 +407,26 @@ uint32_t ps3_pad_poll_menu(uint32_t *out_pressed)
     return cur;
 }
 
+static int is_ps3_btn_pressed(const padData *pd, int btn_id)
+{
+    if (!pd || pd->len == 0) return 0;
+    switch (btn_id) {
+        case PS3_BTN_CROSS:    return pd->BTN_CROSS != 0;
+        case PS3_BTN_CIRCLE:   return pd->BTN_CIRCLE != 0;
+        case PS3_BTN_SQUARE:   return pd->BTN_SQUARE != 0;
+        case PS3_BTN_TRIANGLE: return pd->BTN_TRIANGLE != 0;
+        case PS3_BTN_L1:       return pd->BTN_L1 != 0;
+        case PS3_BTN_R1:       return pd->BTN_R1 != 0;
+        case PS3_BTN_L2:       return pd->BTN_L2 != 0;
+        case PS3_BTN_R2:       return pd->BTN_R2 != 0;
+        case PS3_BTN_L3:       return pd->BTN_L3 != 0;
+        case PS3_BTN_R3:       return pd->BTN_R3 != 0;
+        case PS3_BTN_START:    return pd->BTN_START != 0;
+        case PS3_BTN_SELECT:   return pd->BTN_SELECT != 0;
+        default: return 0;
+    }
+}
+
 static int g_ingame_combo_flag = 0;
 
 void ps3_pad_poll_game(unsigned char joy_out[10])
@@ -403,6 +471,52 @@ void ps3_pad_poll_game(unsigned char joy_out[10])
                 g_take_screenshot_pending = 1;
             }
             s_r3_prev = r3_now;
+
+            int ff_btn = 0;
+            if (g_cfg.map_fastforward == PS3_BTN_L3) {
+                ff_btn = (pd->BTN_L3 && !pd->BTN_R3);
+            } else if (g_cfg.map_fastforward != PS3_BTN_NONE && g_cfg.map_fastforward != PS3_BTN_R2) {
+                ff_btn = is_ps3_btn_pressed(pd, g_cfg.map_fastforward);
+            }
+            if (!ff_btn && g_cfg.map_fastforward != PS3_BTN_NONE && pd->BTN_L3 && !pd->BTN_R3) {
+                ff_btn = 1;
+            }
+
+            if (s_ff_wait_release) {
+                if (!ff_btn) {
+                    s_ff_wait_release = 0;
+                }
+                s_ff_prev = ff_btn;
+                g_fast_forward_active = s_ff_toggled;
+            } else {
+                if (g_ingame_combo_flag || pd->BTN_R3) {
+                    s_ff_had_combo = 1;
+                }
+                if (ff_btn && !s_ff_prev) {
+                    s_ff_press_us = ps3_now_us();
+                    s_ff_had_combo = (g_ingame_combo_flag || pd->BTN_R3) ? 1 : 0;
+                    if (s_ff_toggled && !s_ff_had_combo) {
+                        s_ff_toggled = 0;
+                        s_ff_wait_release = 1;
+                    }
+                } else if (!ff_btn && s_ff_prev) {
+                    if (!s_ff_had_combo && !s_ff_toggled) {
+                        uint64_t held_us = ps3_now_us() - s_ff_press_us;
+                        if (held_us < 350000ULL) {
+                            s_ff_toggled = 1;
+                        }
+                    }
+                    s_ff_had_combo = 0;
+                }
+                s_ff_prev = ff_btn;
+                if (s_ff_toggled) {
+                    g_fast_forward_active = 1;
+                } else if (ff_btn && !s_ff_had_combo && !s_ff_wait_release) {
+                    g_fast_forward_active = 1;
+                } else {
+                    g_fast_forward_active = 0;
+                }
+            }
         }
 
         unsigned char v = 0x00;
@@ -413,33 +527,37 @@ void ps3_pad_poll_game(unsigned char joy_out[10])
         else if (pd->BTN_RIGHT || pd->ANA_L_H > 0xC0) v |= 0x20;
 
         if (g_six_button_mode) {
-            if (pd->BTN_CROSS)  v |= 0x02;
-            if (pd->BTN_CIRCLE) v |= 0x01;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_ii)) v |= 0x01;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_i))  v |= 0x02;
 
             unsigned char vex = 0x00;
-            if (pd->BTN_SQUARE)   vex |= 0x02;
-            if (pd->BTN_TRIANGLE) vex |= 0x04;
-            if (pd->BTN_R1)       vex |= 0x08;
-            if (pd->BTN_L1)       vex |= 0x08;
-            if (pd->BTN_R2)       vex |= 0x01;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_iii)) vex |= 0x01;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_iv))  vex |= 0x02;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_v))   vex |= 0x04;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_btn_vi))  vex |= 0x08;
 
-            if (pd->BTN_SELECT && !pd->BTN_START) v |= 0x04;
-            if (pd->BTN_START  && !pd->BTN_SELECT) v |= 0x08;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_select) && !is_ps3_btn_pressed(pd, g_cfg.map_run)) v |= 0x04;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_run) && !is_ps3_btn_pressed(pd, g_cfg.map_select))  v |= 0x08;
 
             joy_out[pad_idx] = v;
             joy_out[pad_idx + 5] = vex;
             pad_idx++;
         } else {
-            int btn_i  = g_cfg.swap_i_ii ? (pd->BTN_CROSS  != 0) : (pd->BTN_CIRCLE != 0);
-            int btn_ii = g_cfg.swap_i_ii ? (pd->BTN_SQUARE != 0) : (pd->BTN_CROSS  != 0);
-            int trb_i  = pd->BTN_R1 != 0 || pd->BTN_TRIANGLE != 0;
-            int trb_ii = pd->BTN_L1 != 0 || (g_cfg.swap_i_ii ? (pd->BTN_CIRCLE != 0) : (pd->BTN_SQUARE != 0));
+            int btn_i  = is_ps3_btn_pressed(pd, g_cfg.map_btn_i);
+            int btn_ii = is_ps3_btn_pressed(pd, g_cfg.map_btn_ii);
+            int trb_i  = is_ps3_btn_pressed(pd, g_cfg.map_turbo_i);
+            int trb_ii = is_ps3_btn_pressed(pd, g_cfg.map_turbo_ii);
+
+            if (g_cfg.swap_i_ii) {
+                int tmp = btn_i; btn_i = btn_ii; btn_ii = tmp;
+                tmp = trb_i; trb_i = trb_ii; trb_ii = tmp;
+            }
 
             if (btn_ii || (trb_ii && turbo_on)) v |= 0x01;
             if (btn_i  || (trb_i  && turbo_on)) v |= 0x02;
 
-            if (pd->BTN_SELECT && !pd->BTN_START) v |= 0x04;
-            if (pd->BTN_START  && !pd->BTN_SELECT) v |= 0x08;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_select) && !is_ps3_btn_pressed(pd, g_cfg.map_run)) v |= 0x04;
+            if (is_ps3_btn_pressed(pd, g_cfg.map_run) && !is_ps3_btn_pressed(pd, g_cfg.map_select))  v |= 0x08;
 
             joy_out[pad_idx] = v;
             joy_out[pad_idx + 5] = 0x00;
@@ -465,9 +583,9 @@ static const char *aspect_label(int a)
 
 static const char *filter_label(int f)
 {
-    if (f == PS3_FILTER_ANISOTROPIC) return "Anisotropic / Sharp";
-    if (f == PS3_FILTER_LINEAR)      return "Bilinear Smooth";
-    return "Nearest Crisp";
+    if (f == PS3_FILTER_ANISOTROPIC) return "Anisotropic";
+    if (f == PS3_FILTER_LINEAR)      return "Linear (Smooth)";
+    return "Nearest (Crisp)";
 }
 
 static const char *turbo_label(int rate)
@@ -619,6 +737,203 @@ static void run_state_manager_modal(void)
     }
 }
 
+void run_controller_remap_modal(void)
+{
+    enum {
+        REMAP_BTN_I = 0,
+        REMAP_BTN_II,
+        REMAP_TURBO_I,
+        REMAP_TURBO_II,
+        REMAP_BTN_III,
+        REMAP_BTN_IV,
+        REMAP_BTN_V,
+        REMAP_BTN_VI,
+        REMAP_RUN,
+        REMAP_SELECT,
+        REMAP_FAST_FORWARD,
+        REMAP_FF_SPEED,
+        REMAP_PRESET_DEFAULT,
+        REMAP_PRESET_SNES,
+        REMAP_PRESET_ARCADE,
+        REMAP_RESET_DEFAULTS,
+        REMAP_ROW_COUNT
+    };
+
+    int sel = 0;
+
+    for (int i = 0; i < 8; i++) {
+        uint32_t dummy = 0;
+        ps3_pad_poll_menu(&dummy);
+    }
+
+    while (!g_app_should_quit) {
+        ps3_check_sysutil();
+        uint32_t pressed = 0;
+        ps3_pad_poll_menu(&pressed);
+
+        if (pressed & (PS3_ACT_CANCEL | PS3_ACT_MENU)) {
+            ps3_config_save();
+            return;
+        }
+
+        if (pressed & PS3_ACT_UP)   sel = (sel + REMAP_ROW_COUNT - 1) % REMAP_ROW_COUNT;
+        if (pressed & PS3_ACT_DOWN) sel = (sel + 1) % REMAP_ROW_COUNT;
+
+        int left  = (pressed & PS3_ACT_LEFT)  != 0;
+        int right = (pressed & PS3_ACT_RIGHT) != 0;
+        int enter = (pressed & (PS3_ACT_CONFIRM | PS3_ACT_START)) != 0;
+
+        int *target_btn = NULL;
+        switch (sel) {
+            case REMAP_BTN_I:         target_btn = &g_cfg.map_btn_i; break;
+            case REMAP_BTN_II:        target_btn = &g_cfg.map_btn_ii; break;
+            case REMAP_TURBO_I:       target_btn = &g_cfg.map_turbo_i; break;
+            case REMAP_TURBO_II:      target_btn = &g_cfg.map_turbo_ii; break;
+            case REMAP_BTN_III:       target_btn = &g_cfg.map_btn_iii; break;
+            case REMAP_BTN_IV:        target_btn = &g_cfg.map_btn_iv; break;
+            case REMAP_BTN_V:         target_btn = &g_cfg.map_btn_v; break;
+            case REMAP_BTN_VI:        target_btn = &g_cfg.map_btn_vi; break;
+            case REMAP_RUN:           target_btn = &g_cfg.map_run; break;
+            case REMAP_SELECT:        target_btn = &g_cfg.map_select; break;
+            case REMAP_FAST_FORWARD:  target_btn = &g_cfg.map_fastforward; break;
+        }
+
+        if (target_btn) {
+            if (left)  *target_btn = (*target_btn + PS3_BTN_MAX - 1) % PS3_BTN_MAX;
+            if (right || enter) *target_btn = (*target_btn + 1) % PS3_BTN_MAX;
+        } else if (sel == REMAP_FF_SPEED) {
+            if (left)  g_cfg.fast_forward_speed = (g_cfg.fast_forward_speed <= 2) ? 5 : g_cfg.fast_forward_speed - 1;
+            if (right || enter) g_cfg.fast_forward_speed = (g_cfg.fast_forward_speed >= 5) ? 2 : g_cfg.fast_forward_speed + 1;
+        } else if (sel == REMAP_PRESET_DEFAULT && enter) {
+            g_cfg.map_btn_i       = PS3_BTN_CIRCLE;
+            g_cfg.map_btn_ii      = PS3_BTN_CROSS;
+            g_cfg.map_turbo_i     = PS3_BTN_TRIANGLE;
+            g_cfg.map_turbo_ii    = PS3_BTN_SQUARE;
+            g_cfg.map_btn_iii     = PS3_BTN_R1;
+            g_cfg.map_btn_iv      = PS3_BTN_SQUARE;
+            g_cfg.map_btn_v       = PS3_BTN_TRIANGLE;
+            g_cfg.map_btn_vi      = PS3_BTN_R2;
+            g_cfg.map_run         = PS3_BTN_START;
+            g_cfg.map_select      = PS3_BTN_SELECT;
+            g_cfg.map_fastforward = PS3_BTN_L3;
+            ps3_video_toast("Preset: PC Engine Standard Applied", 90);
+        } else if (sel == REMAP_PRESET_SNES && enter) {
+            g_cfg.map_btn_i       = PS3_BTN_CROSS;
+            g_cfg.map_btn_ii      = PS3_BTN_SQUARE;
+            g_cfg.map_turbo_i     = PS3_BTN_CIRCLE;
+            g_cfg.map_turbo_ii    = PS3_BTN_TRIANGLE;
+            g_cfg.map_fastforward = PS3_BTN_L3;
+            ps3_video_toast("Preset: Modern / SNES Applied", 90);
+        } else if (sel == REMAP_PRESET_ARCADE && enter) {
+            g_cfg.map_btn_i       = PS3_BTN_SQUARE;
+            g_cfg.map_btn_ii      = PS3_BTN_TRIANGLE;
+            g_cfg.map_btn_iii     = PS3_BTN_R1;
+            g_cfg.map_btn_iv      = PS3_BTN_CROSS;
+            g_cfg.map_btn_v       = PS3_BTN_CIRCLE;
+            g_cfg.map_btn_vi      = PS3_BTN_R2;
+            g_cfg.map_fastforward = PS3_BTN_L3;
+            ps3_video_toast("Preset: 6-Btn Fighting Applied", 90);
+        } else if (sel == REMAP_RESET_DEFAULTS && enter) {
+            g_cfg.map_btn_i       = PS3_BTN_CIRCLE;
+            g_cfg.map_btn_ii      = PS3_BTN_CROSS;
+            g_cfg.map_turbo_i     = PS3_BTN_TRIANGLE;
+            g_cfg.map_turbo_ii    = PS3_BTN_SQUARE;
+            g_cfg.map_btn_iii     = PS3_BTN_R1;
+            g_cfg.map_btn_iv      = PS3_BTN_SQUARE;
+            g_cfg.map_btn_v       = PS3_BTN_TRIANGLE;
+            g_cfg.map_btn_vi      = PS3_BTN_R2;
+            g_cfg.map_run         = PS3_BTN_START;
+            g_cfg.map_select      = PS3_BTN_SELECT;
+            g_cfg.map_fastforward = PS3_BTN_L3;
+            g_cfg.fast_forward_speed = 3;
+            ps3_video_toast("Controls Reset to Defaults", 90);
+        }
+
+        ps3_video_render_game_to_fb(io.screen_w, io.screen_h);
+        ps3_draw_rect(0, 0, PS3_SCREEN_W, PS3_SCREEN_H, 0xC8050A16u);
+
+        int mw = 1000;
+        int mh = 620;
+        int mx = (PS3_SCREEN_W - mw) / 2;
+        int my = (PS3_SCREEN_H - mh) / 2;
+
+        ps3_draw_panel(mx, my, mw, mh, 0xF6132648u, 0xF60A1326u, 0xFF4AD2FFu);
+        ps3_draw_rect(mx + 2, my + 2, mw - 4, 4, 0xFFFF7A18u);
+        ps3_draw_text_shadow(mx + 28, my + 14, 0xFFFFFFFFu, 2, "CONTROLLER REMAPPING & TURBO");
+        ps3_draw_badge(mx + mw - 190, my + 16, "CUSTOM PAD", 0xFF1D4682u, 0xFF8AEBFFu);
+        ps3_draw_hline(mx + 20, my + 46, mw - 40, 0xFF2B4F88u);
+
+        int lx = mx + 24;
+        int ly = my + 54;
+        int lw = 560;
+        int rh = 30;
+        int rg = 34;
+
+        char ff_str[32];
+        snprintf(ff_str, sizeof(ff_str), "%dx Speed", g_cfg.fast_forward_speed);
+
+        ps3_draw_selector_row(lx, ly + 0  * rg, lw, rh, "Button I (Confirm / Jump)", ps3_btn_name(g_cfg.map_btn_i), sel == REMAP_BTN_I);
+        ps3_draw_selector_row(lx, ly + 1  * rg, lw, rh, "Button II (Attack / Fire)",  ps3_btn_name(g_cfg.map_btn_ii), sel == REMAP_BTN_II);
+        ps3_draw_selector_row(lx, ly + 2  * rg, lw, rh, "Turbo Button I",             ps3_btn_name(g_cfg.map_turbo_i), sel == REMAP_TURBO_I);
+        ps3_draw_selector_row(lx, ly + 3  * rg, lw, rh, "Turbo Button II",            ps3_btn_name(g_cfg.map_turbo_ii), sel == REMAP_TURBO_II);
+        ps3_draw_selector_row(lx, ly + 4  * rg, lw, rh, "Button III (6-Btn Pad)",     ps3_btn_name(g_cfg.map_btn_iii), sel == REMAP_BTN_III);
+        ps3_draw_selector_row(lx, ly + 5  * rg, lw, rh, "Button IV (6-Btn Pad)",      ps3_btn_name(g_cfg.map_btn_iv), sel == REMAP_BTN_IV);
+        ps3_draw_selector_row(lx, ly + 6  * rg, lw, rh, "Button V (6-Btn Pad)",       ps3_btn_name(g_cfg.map_btn_v), sel == REMAP_BTN_V);
+        ps3_draw_selector_row(lx, ly + 7  * rg, lw, rh, "Button VI (6-Btn Pad)",      ps3_btn_name(g_cfg.map_btn_vi), sel == REMAP_BTN_VI);
+        ps3_draw_selector_row(lx, ly + 8  * rg, lw, rh, "Run Button (PCE Start)",     ps3_btn_name(g_cfg.map_run), sel == REMAP_RUN);
+        ps3_draw_selector_row(lx, ly + 9  * rg, lw, rh, "Select Button (PCE Select)", ps3_btn_name(g_cfg.map_select), sel == REMAP_SELECT);
+        ps3_draw_selector_row(lx, ly + 10 * rg, lw, rh, "Fast Forward Trigger",       ps3_btn_name(g_cfg.map_fastforward), sel == REMAP_FAST_FORWARD);
+        ps3_draw_selector_row(lx, ly + 11 * rg, lw, rh, "Fast Forward Speed",         ff_str, sel == REMAP_FF_SPEED);
+
+        ps3_draw_card_row(lx, ly + 12 * rg, lw, rh, sel == REMAP_PRESET_DEFAULT);
+        ps3_draw_text_shadow(lx + 18, ly + 12 * rg + 6, (sel == REMAP_PRESET_DEFAULT) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Apply Preset: PC Engine Standard");
+
+        ps3_draw_card_row(lx, ly + 13 * rg, lw, rh, sel == REMAP_PRESET_SNES);
+        ps3_draw_text_shadow(lx + 18, ly + 13 * rg + 6, (sel == REMAP_PRESET_SNES) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Apply Preset: Modern / SNES Style");
+
+        ps3_draw_card_row(lx, ly + 14 * rg, lw, rh, sel == REMAP_PRESET_ARCADE);
+        ps3_draw_text_shadow(lx + 18, ly + 14 * rg + 6, (sel == REMAP_PRESET_ARCADE) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Apply Preset: 6-Btn Fighting (SFII)");
+
+        ps3_draw_card_row(lx, ly + 15 * rg, lw, rh, sel == REMAP_RESET_DEFAULTS);
+        ps3_draw_text_shadow(lx + 18, ly + 15 * rg + 6, (sel == REMAP_RESET_DEFAULTS) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Reset All Controls to Default");
+
+        int rx = mx + 608;
+        int ry = my + 54;
+        int rw = mw - 632;
+        ps3_draw_panel(rx, ry, rw, 544, 0xE80D1A32u, 0xE8081020u, 0xFF2D548Eu);
+        ps3_draw_text_shadow(rx + 20, ry + 14, 0xFF7CE8FFu, 2, "QUICK INSTRUCTIONS");
+        ps3_draw_hline(rx + 18, ry + 42, rw - 36, 0xFF234274u);
+
+        ps3_draw_text(rx + 20, ry + 56, 0xFFDCE8FCu, 1, "- Navigate rows with UP / DOWN.");
+        ps3_draw_text(rx + 20, ry + 84, 0xFFDCE8FCu, 1, "- Use LEFT / RIGHT / CROSS to");
+        ps3_draw_text(rx + 20, ry + 104, 0xFFDCE8FCu, 1, "  change assigned button.");
+        ps3_draw_text(rx + 20, ry + 134, 0xFFDCE8FCu, 1, "- Tap or hold Fast Forward to");
+        ps3_draw_text(rx + 20, ry + 154, 0xFFDCE8FCu, 1, "  speed up emulation in-game.");
+        ps3_draw_text(rx + 20, ry + 184, 0xFFDCE8FCu, 1, "- Press L2 + R2 anytime during");
+        ps3_draw_text(rx + 20, ry + 204, 0xFFDCE8FCu, 1, "  gameplay for Quick Menu.");
+        ps3_draw_text(rx + 20, ry + 234, 0xFFDCE8FCu, 1, "- Press R3 anytime for Instant");
+        ps3_draw_text(rx + 20, ry + 254, 0xFFDCE8FCu, 1, "  Screenshot to HDD / USB.");
+
+        ps3_draw_hline(rx + 18, ry + 288, rw - 36, 0xFF234274u);
+        ps3_draw_text_shadow(rx + 20, ry + 304, 0xFFFF9E3Du, 1, "CURRENT ASSIGNMENT");
+        char map_info[64];
+        snprintf(map_info, sizeof(map_info), "I: %s   II: %s", ps3_btn_name(g_cfg.map_btn_i), ps3_btn_name(g_cfg.map_btn_ii));
+        ps3_draw_text(rx + 20, ry + 332, 0xFFFFFFFFu, 1, map_info);
+        snprintf(map_info, sizeof(map_info), "Trb I: %s   Trb II: %s", ps3_btn_name(g_cfg.map_turbo_i), ps3_btn_name(g_cfg.map_turbo_ii));
+        ps3_draw_text(rx + 20, ry + 358, 0xFFFFFFFFu, 1, map_info);
+        snprintf(map_info, sizeof(map_info), "Run: %s   Select: %s", ps3_btn_name(g_cfg.map_run), ps3_btn_name(g_cfg.map_select));
+        ps3_draw_text(rx + 20, ry + 384, 0xFFFFFFFFu, 1, map_info);
+        snprintf(map_info, sizeof(map_info), "Fast Forward: %s (%dx)", ps3_btn_name(g_cfg.map_fastforward), g_cfg.fast_forward_speed);
+        ps3_draw_text(rx + 20, ry + 410, 0xFFFFDD66u, 1, map_info);
+
+        const int btns[] = { BTN_ICON_DPAD, BTN_ICON_CROSS, BTN_ICON_CIRCLE };
+        const char *lbls[] = { "Navigate / Change", "Select / Cycle", "Save & Return" };
+        ps3_draw_footer_buttons(btns, lbls, 3);
+
+        ps3_video_present();
+    }
+}
+
 int ps3_ingame_menu_run(void)
 {
     enum {
@@ -630,6 +945,8 @@ int ps3_ingame_menu_run(void)
         QM_ASPECT,
         QM_FILTER,
         QM_SCANLINES,
+        QM_FAST_FORWARD,
+        QM_REMAP_CTRL,
         QM_CTRL_TYPE,
         QM_SWAP_BTNS,
         QM_VOLUME,
@@ -640,6 +957,7 @@ int ps3_ingame_menu_run(void)
     };
 
     int sel = 0;
+    reset_fast_forward_state(1);
     ps3_audio_pause(1);
 
     for (int i = 0; i < 8; i++) {
@@ -732,14 +1050,24 @@ int ps3_ingame_menu_run(void)
                 break;
 
             case QM_FILTER:
-                if (left || right || enter) {
-                    g_cfg.filter = (g_cfg.filter + 1) % PS3_FILTER_COUNT;
-                    ps3_video_apply_filter();
-                }
+                if (left)  g_cfg.filter = (g_cfg.filter + PS3_FILTER_COUNT - 1) % PS3_FILTER_COUNT;
+                if (right || enter) g_cfg.filter = (g_cfg.filter + 1) % PS3_FILTER_COUNT;
+                ps3_video_apply_filter();
                 break;
 
             case QM_SCANLINES:
                 if (left || right || enter) g_cfg.scanlines = !g_cfg.scanlines;
+                break;
+
+            case QM_FAST_FORWARD:
+                if (left)  g_cfg.fast_forward_speed = (g_cfg.fast_forward_speed <= 2) ? 5 : g_cfg.fast_forward_speed - 1;
+                if (right || enter) g_cfg.fast_forward_speed = (g_cfg.fast_forward_speed >= 5) ? 2 : g_cfg.fast_forward_speed + 1;
+                break;
+
+            case QM_REMAP_CTRL:
+                if (enter) {
+                    run_controller_remap_modal();
+                }
                 break;
 
             case QM_CTRL_TYPE:
@@ -793,8 +1121,8 @@ int ps3_ingame_menu_run(void)
         ps3_video_render_game_to_fb(io.screen_w, io.screen_h);
         ps3_draw_rect(0, 0, PS3_SCREEN_W, PS3_SCREEN_H, 0xB8050A16u);
 
-        int mw = 980;
-        int mh = 610;
+        int mw = 1000;
+        int mh = 630;
         int mx = (PS3_SCREEN_W - mw) / 2;
         int my = (PS3_SCREEN_H - mh) / 2;
 
@@ -807,9 +1135,9 @@ int ps3_ingame_menu_run(void)
 
         int lx = mx + 22;
         int ly = my + 52;
-        int lw = 560;
-        int rh = 34;
-        int rg = 38;
+        int lw = 570;
+        int rh = 30;
+        int rg = 34;
 
         char slot_str[48];
         int has_st = ps3_state_exists(g_quick_slot);
@@ -818,42 +1146,50 @@ int ps3_ingame_menu_run(void)
         char vol_str[32];
         snprintf(vol_str, sizeof(vol_str), "%d%%", g_cfg.audio_volume);
 
+        char ff_str[32];
+        snprintf(ff_str, sizeof(ff_str), "%dx Speed", g_cfg.fast_forward_speed);
+
         ps3_draw_card_row(lx, ly + 0 * rg, lw, rh, sel == QM_RESUME);
-        ps3_draw_text_shadow(lx + 18, ly + 0 * rg + 7, (sel == QM_RESUME) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Resume Game");
+        ps3_draw_text_shadow(lx + 18, ly + 0 * rg + 6, (sel == QM_RESUME) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Resume Game");
 
         ps3_draw_selector_row(lx, ly + 1 * rg, lw, rh, "Quick Save State", slot_str, sel == QM_SAVE_STATE);
         ps3_draw_selector_row(lx, ly + 2 * rg, lw, rh, "Quick Load State", slot_str, sel == QM_LOAD_STATE);
 
         ps3_draw_card_row(lx, ly + 3 * rg, lw, rh, sel == QM_STATE_MGR);
-        ps3_draw_text_shadow(lx + 18, ly + 3 * rg + 7, (sel == QM_STATE_MGR) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Open 10-Slot State Manager...");
+        ps3_draw_text_shadow(lx + 18, ly + 3 * rg + 6, (sel == QM_STATE_MGR) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Open 10-Slot State Manager...");
 
         ps3_draw_card_row(lx, ly + 4 * rg, lw, rh, sel == QM_SCREENSHOT);
-        ps3_draw_text_shadow(lx + 18, ly + 4 * rg + 7, (sel == QM_SCREENSHOT) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Take Screenshot (Save to HDD)");
+        ps3_draw_text_shadow(lx + 18, ly + 4 * rg + 6, (sel == QM_SCREENSHOT) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Take Screenshot (Save to HDD & Preview)");
 
         ps3_draw_selector_row(lx, ly + 5 * rg, lw, rh, "Aspect Ratio", aspect_label(g_cfg.aspect), sel == QM_ASPECT);
         ps3_draw_selector_row(lx, ly + 6 * rg, lw, rh, "Video Filter", filter_label(g_cfg.filter), sel == QM_FILTER);
         ps3_draw_switch_row(lx,   ly + 7 * rg, lw, rh, "CRT Scanlines", g_cfg.scanlines, sel == QM_SCANLINES);
-        ps3_draw_selector_row(lx, ly + 8 * rg, lw, rh, "Controller Type",
+        ps3_draw_selector_row(lx, ly + 8 * rg, lw, rh, "Fast Forward Speed", ff_str, sel == QM_FAST_FORWARD);
+
+        ps3_draw_card_row(lx, ly + 9 * rg, lw, rh, sel == QM_REMAP_CTRL);
+        ps3_draw_text_shadow(lx + 18, ly + 9 * rg + 6, (sel == QM_REMAP_CTRL) ? 0xFFFFFFFFu : 0xFFD0DEFAu, 2, "Controller Remapping & Presets...");
+
+        ps3_draw_selector_row(lx, ly + 10 * rg, lw, rh, "Controller Type",
                               pad_mode_label(g_cfg.six_button_pad),
                               sel == QM_CTRL_TYPE);
-        ps3_draw_selector_row(lx, ly + 9 * rg, lw, rh, "Button Mapping",
+        ps3_draw_selector_row(lx, ly + 11 * rg, lw, rh, "Quick Button Swap",
                               g_cfg.swap_i_ii ? "Cross=I / Square=II" : "Circle=I / Cross=II",
                               sel == QM_SWAP_BTNS);
-        ps3_draw_slider_row(lx,   ly + 10 * rg, lw, rh, "Master Volume", g_cfg.audio_volume, vol_str, sel == QM_VOLUME);
+        ps3_draw_slider_row(lx,   ly + 12 * rg, lw, rh, "Master Volume", g_cfg.audio_volume, vol_str, sel == QM_VOLUME);
 
-        ps3_draw_card_row(lx, ly + 11 * rg, lw, rh, sel == QM_RESET);
-        ps3_draw_text_shadow(lx + 18, ly + 11 * rg + 7, (sel == QM_RESET) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Soft Reset Console");
+        ps3_draw_card_row(lx, ly + 13 * rg, lw, rh, sel == QM_RESET);
+        ps3_draw_text_shadow(lx + 18, ly + 13 * rg + 6, (sel == QM_RESET) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Soft Reset Console");
 
-        ps3_draw_card_row(lx, ly + 12 * rg, lw, rh, sel == QM_QUIT_ROM);
-        ps3_draw_text_shadow(lx + 18, ly + 12 * rg + 7, (sel == QM_QUIT_ROM) ? 0xFFFF9E3Du : 0xFFD0DEFAu, 2, "Return to Main Menu");
+        ps3_draw_card_row(lx, ly + 14 * rg, lw, rh, sel == QM_QUIT_ROM);
+        ps3_draw_text_shadow(lx + 18, ly + 14 * rg + 6, (sel == QM_QUIT_ROM) ? 0xFFFF9E3Du : 0xFFD0DEFAu, 2, "Return to Main Menu");
 
-        ps3_draw_card_row(lx, ly + 13 * rg, lw, rh, sel == QM_EXIT_XMB);
-        ps3_draw_text_shadow(lx + 18, ly + 13 * rg + 7, (sel == QM_EXIT_XMB) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
+        ps3_draw_card_row(lx, ly + 15 * rg, lw, rh, sel == QM_EXIT_XMB);
+        ps3_draw_text_shadow(lx + 18, ly + 15 * rg + 6, (sel == QM_EXIT_XMB) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
 
-        int rx = mx + 602;
-        int ry = my + 54;
-        int rw = mw - 624;
-        ps3_draw_panel(rx, ry, rw, 524, 0xE80D1A32u, 0xE8081020u, 0xFF2D548Eu);
+        int rx = mx + 614;
+        int ry = my + 50;
+        int rw = mw - 636;
+        ps3_draw_panel(rx, ry, rw, 550, 0xE80D1A32u, 0xE8081020u, 0xFF2D548Eu);
 
         char slot_hdr[48];
         snprintf(slot_hdr, sizeof(slot_hdr), "SLOT %d PREVIEW", g_quick_slot);
@@ -863,18 +1199,19 @@ int ps3_ingame_menu_run(void)
                        has_st ? 0xFF167C52u : 0xFF1E2D4Au,
                        has_st ? 0xFFFFFFFFu : 0xFF8EA8D0u);
 
-        ps3_draw_thumb_box(rx + 24, ry + 48, rw - 48, 224,
+        ps3_draw_thumb_box(rx + 24, ry + 46, rw - 48, 220,
                            g_slot_thumb_valid ? g_slot_thumb_argb : NULL,
                            PS3_THUMB_W, PS3_THUMB_H,
                            has_st ? "SAVED STATE" : "EMPTY SLOT");
 
-        ps3_draw_hline(rx + 18, ry + 288, rw - 36, 0xFF234274u);
-        ps3_draw_text_shadow(rx + 20, ry + 300, 0xFFFF9E3Du, 1, "QUICK CONTROLS");
-        ps3_draw_btn_label(rx + 20, ry + 328, BTN_ICON_DPAD,   "Navigate / Adjust", 0xFFDCE8FCu);
-        ps3_draw_btn_label(rx + 20, ry + 360, BTN_ICON_CROSS,  "Confirm / Activate", 0xFFDCE8FCu);
-        ps3_draw_btn_label(rx + 20, ry + 392, BTN_ICON_CIRCLE, "Resume Gameplay", 0xFFDCE8FCu);
-        ps3_draw_btn_label(rx + 20, ry + 424, BTN_ICON_L2,     "+ R2  Toggle Quick Menu", 0xFFDCE8FCu);
-        ps3_draw_btn_label(rx + 20, ry + 456, BTN_ICON_R3,     "In-Game Instant Screenshot", 0xFFDCE8FCu);
+        ps3_draw_hline(rx + 18, ry + 280, rw - 36, 0xFF234274u);
+        ps3_draw_text_shadow(rx + 20, ry + 294, 0xFFFF9E3Du, 1, "QUICK CONTROLS");
+        ps3_draw_btn_label(rx + 20, ry + 322, BTN_ICON_DPAD,   "Navigate / Adjust Setting", 0xFFDCE8FCu);
+        ps3_draw_btn_label(rx + 20, ry + 352, BTN_ICON_CROSS,  "Confirm / Open Submenu", 0xFFDCE8FCu);
+        ps3_draw_btn_label(rx + 20, ry + 382, BTN_ICON_CIRCLE, "Resume Gameplay", 0xFFDCE8FCu);
+        ps3_draw_btn_label(rx + 20, ry + 412, BTN_ICON_L2,     "+ R2  Toggle Quick Menu", 0xFFDCE8FCu);
+        ps3_draw_btn_label(rx + 20, ry + 442, btn_id_to_icon(g_cfg.map_fastforward), "Tap/Hold: Fast Forward", 0xFFDCE8FCu);
+        ps3_draw_btn_label(rx + 20, ry + 472, BTN_ICON_R3,     "In-Game Instant Screenshot", 0xFFDCE8FCu);
 
         ps3_video_present();
     }
@@ -882,34 +1219,40 @@ int ps3_ingame_menu_run(void)
     return 1;
 }
 
-static uint64_t g_last_frame_usec = 0;
-
-static uint64_t now_frame_usec(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
-
 void ps3_frame_hook(void)
 {
-    interrupt_60hz();
-
-    const uint64_t target = 16667ULL;
-    uint64_t t = now_frame_usec();
-    if (g_last_frame_usec != 0) {
-        uint64_t elapsed = t - g_last_frame_usec;
-        if (elapsed < target) {
-            uint64_t wait_us = target - elapsed;
-            if (wait_us > 500) {
-                usleep((useconds_t)(wait_us - 200));
-            }
-        }
+    if (g_fast_forward_active) {
+        ps3_audio_push_frame(1);
+        s_pacer_target_us = 0;
+        return;
     }
-    g_last_frame_usec = now_frame_usec();
+
+    ps3_audio_push_frame(PS3_AUDIO_RATE / 60);
+
+    interrupt_60hz();
 
     if (ps3_pad_ingame_combo_triggered()) {
         ps3_ingame_menu_run();
+        s_pacer_target_us = 0;
+        return;
+    }
+
+    {
+        uint64_t interval = 16666ULL;
+        uint64_t now = ps3_now_us();
+        if (s_pacer_target_us == 0 || now > s_pacer_target_us + 100000ULL) {
+            s_pacer_target_us = now + interval;
+        } else {
+            if (now < s_pacer_target_us) {
+                uint64_t diff = s_pacer_target_us - now;
+                if (diff > 1500ULL) {
+                    sysUsleep((unsigned int)(diff - 1000ULL));
+                }
+                while (ps3_now_us() < s_pacer_target_us) {
+                }
+            }
+            s_pacer_target_us += interval;
+        }
     }
 }
 
@@ -939,6 +1282,8 @@ static int detect_media_type(const char *name)
     if (strcasecmp(dot, ".sgx") == 0) return PCE_MEDIA_SGX;
     if (strcasecmp(dot, ".cue") == 0 ||
         strcasecmp(dot, ".iso") == 0 ||
+        strcasecmp(dot, ".bin") == 0 ||
+        strcasecmp(dot, ".img") == 0 ||
         strcasecmp(dot, ".hcd") == 0) return PCE_MEDIA_CDROM;
     if (strcasecmp(dot, ".zip") == 0) return PCE_MEDIA_ZIP;
     return -1;
@@ -1240,6 +1585,30 @@ int ps3_validate_pce_file(const char *path)
     return 1;
 }
 
+static int find_sibling_cue(const char *bin_path, char *out, size_t cap)
+{
+    char base[512];
+    char *dot;
+    static const char *exts[] = { ".cue", ".CUE", NULL };
+
+    if (!bin_path || !out || cap == 0) return 0;
+    snprintf(base, sizeof(base), "%s", bin_path);
+    dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+
+    for (int i = 0; exts[i]; i++) {
+        FILE *f;
+        snprintf(out, cap, "%s%s", base, exts[i]);
+        f = fopen(out, "rb");
+        if (f) {
+            fclose(f);
+            return 1;
+        }
+    }
+    out[0] = '\0';
+    return 0;
+}
+
 static void launch_selected_game(const char *selected_path)
 {
     if (!selected_path || !selected_path[0]) return;
@@ -1256,7 +1625,20 @@ static void launch_selected_game(const char *selected_path)
     int is_cue = (dot && strcasecmp(dot, ".cue") == 0);
     int is_iso = (dot && strcasecmp(dot, ".iso") == 0);
     int is_hcd = (dot && strcasecmp(dot, ".hcd") == 0);
+    int is_bin = (dot && (strcasecmp(dot, ".bin") == 0 || strcasecmp(dot, ".img") == 0));
     int is_zip = (dot && strcasecmp(dot, ".zip") == 0);
+
+    if (is_bin) {
+        char cue_path[512];
+        if (find_sibling_cue(selected_path, cue_path, sizeof(cue_path))) {
+            snprintf(actual_rom_path, sizeof(actual_rom_path), "%s", cue_path);
+            ps3_log("CD: using CUE %s\n", cue_path);
+            is_bin = 0;
+            is_cue = 1;
+        } else {
+            ps3_log("CD: no sibling CUE, opening %s as ISO\n", selected_path);
+        }
+    }
 
     if (is_zip) {
         if (ps3_zip_extract_pce(selected_path, actual_rom_path, sizeof(actual_rom_path)) != 0) {
@@ -1268,7 +1650,7 @@ static void launch_selected_game(const char *selected_path)
         }
     }
 
-    if (!is_cue && !is_iso && !is_hcd) {
+    if (!is_cue && !is_iso && !is_hcd && !is_bin) {
         if (!ps3_validate_pce_file(actual_rom_path)) {
             ps3_show_error_dialog("INVALID ROM FILE",
                                   "The selected file is not a valid PC Engine ROM.",
@@ -1286,7 +1668,7 @@ static void launch_selected_game(const char *selected_path)
     snprintf(bram_file, sizeof(bram_file), "%s/%s.brm", PS3_BRAM_DIR, g_rom_base);
 
     char syscard_path[512] = {0};
-    if (is_cue || is_iso || is_hcd) {
+    if (is_cue || is_iso || is_hcd || is_bin) {
         if (!ps3_find_syscard(syscard_path, sizeof(syscard_path))) {
             ps3_log("CD-ROM2 game requested but syscard3.pce not found!\n");
             ps3_show_error_dialog("MISSING SYSCARD3.PCE BIOS",
@@ -1305,6 +1687,10 @@ static void launch_selected_game(const char *selected_path)
             snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
             init_rc = InitPCE(syscard_path, bram_file);
         }
+    } else if (is_bin) {
+        CD_emulation = 2;
+        snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
+        init_rc = InitPCE(syscard_path, bram_file);
     } else if (is_iso) {
         CD_emulation = 2;
         snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
@@ -1336,12 +1722,17 @@ static void launch_selected_game(const char *selected_path)
         g_slot_thumb_loaded_slot = -1;
         ps3_bram_load(g_rom_base);
         ps3_audio_pause(0);
-        char launch_msg[256];
-        snprintf(launch_msg, sizeof(launch_msg), "%s", g_rom_base);
-        ps3_video_toast(launch_msg, 120);
         ensure_paddata_init();
         for (int p = 0; p < MAX_PADS; p++) reset_paddata_entry(p);
+        ps3_video_clear(0, 0, 0);
+        ps3_video_present();
+        ps3_video_clear(0, 0, 0);
+        reset_fast_forward_state(0);
         RunPCE();
+        reset_fast_forward_state(0);
+        ps3_video_clear(0, 0, 0);
+        ps3_video_present();
+        ps3_video_clear(0, 0, 0);
         ps3_audio_pause(1);
         ps3_bram_save(g_rom_base);
         TrashPCE(bram_file);
@@ -1355,6 +1746,10 @@ static void launch_selected_game(const char *selected_path)
     ps3_cue_unload();
     ps3_zip_cleanup_temp();
 }
+
+static uint32_t s_cached_rom_preview_argb[PS3_THUMB_W * PS3_THUMB_H];
+static char     s_cached_rom_preview_path[512] = "";
+static int      s_cached_rom_preview_valid     = 0;
 
 static void run_main_frontend(void)
 {
@@ -1371,7 +1766,7 @@ static void run_main_frontend(void)
         "LIBRARY",
         "FILE BROWSER",
         "SAVE STATES",
-        "VIDEO & AUDIO",
+        "SETTINGS & INPUT",
         "BIOS & CD-ROM2",
         "CREDITS & EXIT"
     };
@@ -1431,7 +1826,7 @@ static void run_main_frontend(void)
                 refresh_cached_slot_thumb(st_sel);
                 for (int s = 0; s < 10; s++) cached_state_exists[s] = ps3_state_exists(s);
             }
-            if (active_tab == TAB_BIOS || active_tab == TAB_LIBRARY) {
+            if (!cached_has_bios && (active_tab == TAB_BIOS || active_tab == TAB_LIBRARY)) {
                 cached_has_bios = ps3_find_syscard(cached_syscard, sizeof(cached_syscard));
             }
         }
@@ -1442,7 +1837,7 @@ static void run_main_frontend(void)
                 refresh_cached_slot_thumb(st_sel);
                 for (int s = 0; s < 10; s++) cached_state_exists[s] = ps3_state_exists(s);
             }
-            if (active_tab == TAB_BIOS || active_tab == TAB_LIBRARY) {
+            if (!cached_has_bios && (active_tab == TAB_BIOS || active_tab == TAB_LIBRARY)) {
                 cached_has_bios = ps3_find_syscard(cached_syscard, sizeof(cached_syscard));
             }
         }
@@ -1478,6 +1873,8 @@ static void run_main_frontend(void)
             if ((pressed & (PS3_ACT_CONFIRM | PS3_ACT_START)) && g_lib_filtered_count > 0) {
                 const file_entry_t *e = &g_lib_entries[g_lib_filtered[lib_sel]];
                 launch_selected_game(e->full_path);
+                s_cached_rom_preview_path[0] = '\0';
+                s_cached_rom_preview_valid = 0;
             }
         } else if (active_tab == TAB_BROWSER) {
             if (g_browser_count > 0) {
@@ -1526,6 +1923,8 @@ static void run_main_frontend(void)
                     snprintf(g_cfg.last_rom_dir, sizeof(g_cfg.last_rom_dir), "%s", cur_dir);
                     ps3_config_save();
                     launch_selected_game(e->full_path);
+                    s_cached_rom_preview_path[0] = '\0';
+                    s_cached_rom_preview_valid = 0;
                 }
             }
         } else if (active_tab == TAB_STATES) {
@@ -1547,9 +1946,11 @@ static void run_main_frontend(void)
             if ((pressed & PS3_ACT_CONFIRM) && g_active_rom_path[0] && cached_state_exists[st_sel]) {
                 g_quick_slot = st_sel;
                 launch_selected_game(g_active_rom_path);
+                s_cached_rom_preview_path[0] = '\0';
+                s_cached_rom_preview_valid = 0;
             }
         } else if (active_tab == TAB_SETTINGS) {
-            const int cfg_rows = 10;
+            const int cfg_rows = 12;
             if (pressed & PS3_ACT_UP)   cfg_sel = (cfg_sel + cfg_rows - 1) % cfg_rows;
             if (pressed & PS3_ACT_DOWN) cfg_sel = (cfg_sel + 1) % cfg_rows;
             int left  = (pressed & PS3_ACT_LEFT)  != 0;
@@ -1577,6 +1978,10 @@ static void run_main_frontend(void)
                 case 4:
                     if (left)  g_cfg.six_button_pad = (g_cfg.six_button_pad + PS3_PAD_MODE_COUNT - 1) % PS3_PAD_MODE_COUNT;
                     if (right || enter) g_cfg.six_button_pad = (g_cfg.six_button_pad + 1) % PS3_PAD_MODE_COUNT;
+                    if (g_cfg.six_button_pad == PS3_PAD_6BUTTON) g_six_button_mode = 1;
+                    else if (g_cfg.six_button_pad == PS3_PAD_2BUTTON) g_six_button_mode = 0;
+                    else g_six_button_mode = ps3_is_fighting_game(g_active_rom_path, ROM_size);
+                    ps3_log("pad mode: %s\n", pad_mode_label(g_cfg.six_button_pad));
                     break;
                 case 5:
                     if (left || right || enter) g_cfg.swap_i_ii = !g_cfg.swap_i_ii;
@@ -1587,12 +1992,24 @@ static void run_main_frontend(void)
                     if (enter) g_cfg.turbo_rate = (g_cfg.turbo_rate % 4) + 1;
                     break;
                 case 7:
-                    if (left || right || enter) g_cfg.show_fps = !g_cfg.show_fps;
+                    if (left && g_cfg.fast_forward_speed > 2) g_cfg.fast_forward_speed--;
+                    if (right || enter) {
+                        g_cfg.fast_forward_speed++;
+                        if (g_cfg.fast_forward_speed > 5) g_cfg.fast_forward_speed = 2;
+                    }
                     break;
                 case 8:
-                    if (enter) ps3_config_save();
+                    if (enter) {
+                        run_controller_remap_modal();
+                    }
                     break;
                 case 9:
+                    if (left || right || enter) g_cfg.show_fps = !g_cfg.show_fps;
+                    break;
+                case 10:
+                    if (enter) ps3_config_save();
+                    break;
+                case 11:
                     if (enter) ps3_return_to_xmb();
                     break;
             }
@@ -1657,7 +2074,7 @@ static void run_main_frontend(void)
                 ps3_draw_text_shadow(rx + 20, content_y + 288, 0xFFFFCC00u, 1, "SUPPORTED FORMATS:");
                 ps3_draw_text(rx + 20, content_y + 314, 0xFF7CE8FFu, 1, ".pce (HuCARD, also inside .zip)");
                 ps3_draw_text(rx + 20, content_y + 338, 0xFF7CE8FFu, 1, ".sgx (SuperGrafx)");
-                ps3_draw_text(rx + 20, content_y + 362, 0xFF7CE8FFu, 1, ".cue, .iso, .hcd (CD-ROM2)");
+                ps3_draw_text(rx + 20, content_y + 362, 0xFF7CE8FFu, 1, ".cue, .iso, .bin, .img, .hcd (CD-ROM2)");
 
                 ps3_draw_text_shadow(rx + 20, content_y + 402, 0xFF8AA8D8u, 1, "For CD-ROM2 place 'syscard3.pce' in:");
                 ps3_draw_text(rx + 20, content_y + 426, 0xFFD0DEFAu, 1, "/dev_hdd0/pce4ps3/bios/");
@@ -1686,7 +2103,17 @@ static void run_main_frontend(void)
                 }
 
                 const file_entry_t *sel_e = &g_lib_entries[g_lib_filtered[lib_sel]];
-                ps3_draw_media_card(rx, content_y, rw, 310, sel_e->name, sel_e->media_type, media_badge_str(sel_e->media_type));
+                if (strcmp(s_cached_rom_preview_path, sel_e->full_path) != 0) {
+                    snprintf(s_cached_rom_preview_path, sizeof(s_cached_rom_preview_path), "%s", sel_e->full_path);
+                    char base_tmp[256];
+                    extract_rom_basename(sel_e->full_path, base_tmp, sizeof(base_tmp));
+                    s_cached_rom_preview_valid = ps3_load_rom_preview(base_tmp, sel_e->full_path,
+                                                                      s_cached_rom_preview_argb,
+                                                                      PS3_THUMB_W, PS3_THUMB_H);
+                }
+                ps3_draw_media_card(rx, content_y, rw, 310, sel_e->name, sel_e->media_type,
+                                    media_badge_str(sel_e->media_type),
+                                    s_cached_rom_preview_valid ? s_cached_rom_preview_argb : NULL);
 
                 ps3_draw_panel(rx, content_y + 322, rw, content_h - 322, 0xEC0E1B34u, 0xEC081122u, 0xFF2B4F88u);
                 ps3_draw_text_shadow(rx + 18, content_y + 334, 0xFFFF9E3Du, 1, "MEDIA DETAILS");
@@ -1749,7 +2176,7 @@ static void run_main_frontend(void)
             ps3_draw_text_shadow(rx + 20, content_y + 300, 0xFF7CE8FFu, 2, "SUPPORTED FORMATS");
             ps3_draw_text(rx + 20, content_y + 336, 0xFFDCE8FCu, 1, "- .pce : PC Engine / TurboGrafx-16 HuCard");
             ps3_draw_text(rx + 20, content_y + 364, 0xFFDCE8FCu, 1, "- .sgx : NEC PC Engine SuperGrafx");
-            ps3_draw_text(rx + 20, content_y + 392, 0xFFDCE8FCu, 1, "- .cue / .iso / .hcd : CD-ROM2 & Super CD");
+            ps3_draw_text(rx + 20, content_y + 392, 0xFFDCE8FCu, 1, "- .cue / .iso / .bin / .img / .hcd : CD-ROM2 & Super CD");
             ps3_draw_text(rx + 20, content_y + 420, 0xFFDCE8FCu, 1, "- .zip : Compressed HuCard Archives");
 
             const int btns[] = { BTN_ICON_CROSS, BTN_ICON_TRIANGLE, BTN_ICON_SELECT, BTN_ICON_L1 };
@@ -1800,16 +2227,25 @@ static void run_main_frontend(void)
             int pw = PS3_SCREEN_W - 240;
             ps3_draw_panel(px, content_y, pw, content_h, 0xEC0E1B34u, 0xEC081122u, 0xFF2B4F88u);
             ps3_draw_text_shadow(px + 24, content_y + 12, 0xFF7CE8FFu, 2, "DISPLAY, AUDIO & CONTROLLER SETTINGS");
-            ps3_draw_hline(px + 20, content_y + 44, pw - 40, 0xFF244374u);
+            ps3_draw_hline(px + 20, content_y + 42, pw - 40, 0xFF244374u);
 
             int rx = px + 24;
             int rw = pw - 48;
-            int ry = content_y + 54;
-            int rh = 36;
-            int rg = 41;
+            int ry = content_y + 48;
+            int rh = 32;
+            int rg = 36;
 
             char vol_str[32];
             snprintf(vol_str, sizeof(vol_str), "%d%%", g_cfg.audio_volume);
+
+            char ff_str[32];
+            snprintf(ff_str, sizeof(ff_str), "%dx Speed", g_cfg.fast_forward_speed);
+
+            char remap_summary[64];
+            snprintf(remap_summary, sizeof(remap_summary), "I:%s  II:%s  FF:%s",
+                     ps3_btn_name(g_cfg.map_btn_i),
+                     ps3_btn_name(g_cfg.map_btn_ii),
+                     ps3_btn_name(g_cfg.map_fastforward));
 
             ps3_draw_selector_row(rx, ry + 0 * rg, rw, rh, "Display Aspect Ratio", aspect_label(g_cfg.aspect), cfg_sel == 0);
             ps3_draw_selector_row(rx, ry + 1 * rg, rw, rh, "Video Scaling Filter", filter_label(g_cfg.filter), cfg_sel == 1);
@@ -1822,13 +2258,15 @@ static void run_main_frontend(void)
                                   g_cfg.swap_i_ii ? "Cross = I  /  Square = II" : "Circle = I  /  Cross = II",
                                   cfg_sel == 5);
             ps3_draw_selector_row(rx, ry + 6 * rg, rw, rh, "Turbo Fire Rate (L1 / R1)", turbo_label(g_cfg.turbo_rate), cfg_sel == 6);
-            ps3_draw_switch_row(rx,   ry + 7 * rg, rw, rh, "On-Screen FPS Counter", g_cfg.show_fps, cfg_sel == 7);
+            ps3_draw_selector_row(rx, ry + 7 * rg, rw, rh, "Fast Forward Speed", ff_str, cfg_sel == 7);
+            ps3_draw_selector_row(rx, ry + 8 * rg, rw, rh, "Controller Button Remapping...", remap_summary, cfg_sel == 8);
+            ps3_draw_switch_row(rx,   ry + 9 * rg, rw, rh, "On-Screen FPS Counter", g_cfg.show_fps, cfg_sel == 9);
 
-            ps3_draw_card_row(rx, ry + 8 * rg, rw, rh, cfg_sel == 8);
-            ps3_draw_text_shadow(rx + 18, ry + 8 * rg + 9, (cfg_sel == 8) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Save Configuration to Disk (hugo.ini)");
+            ps3_draw_card_row(rx, ry + 10 * rg, rw, rh, cfg_sel == 10);
+            ps3_draw_text_shadow(rx + 18, ry + 10 * rg + 7, (cfg_sel == 10) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Save Configuration to Disk (hugo.ini)");
 
-            ps3_draw_card_row(rx, ry + 9 * rg, rw, rh, cfg_sel == 9);
-            ps3_draw_text_shadow(rx + 18, ry + 9 * rg + 9, (cfg_sel == 9) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
+            ps3_draw_card_row(rx, ry + 11 * rg, rw, rh, cfg_sel == 11);
+            ps3_draw_text_shadow(rx + 18, ry + 11 * rg + 7, (cfg_sel == 11) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
 
             const int btns[] = { BTN_ICON_DPAD, BTN_ICON_CROSS, BTN_ICON_L1 };
             const char *lbls[] = { "Change Setting", "Toggle / Save", "Switch Tabs" };
@@ -1879,24 +2317,26 @@ static void run_main_frontend(void)
             ps3_draw_text_shadow(lx + 24, content_y + 14, 0xFF7CE8FFu, 2, "DUALSHOCK 3 CONTROLS & SHORTCUTS");
             ps3_draw_hline(lx + 20, content_y + 46, lw - 40, 0xFF244374u);
 
-            int cy = content_y + 64;
+            int cy = content_y + 48;
             ps3_draw_btn_label(lx + 28, cy +   0, BTN_ICON_DPAD,     "PC Engine Directional Pad (D-Pad & Left Stick)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy +  44, BTN_ICON_CIRCLE,   "Button I  (Primary Action / Confirm)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy +  88, BTN_ICON_CROSS,    "Button II (Secondary Action / Jump)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy + 132, BTN_ICON_TRIANGLE, "Turbo I   (Rapid Fire Button I)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy + 176, BTN_ICON_SQUARE,   "Turbo II  (Rapid Fire Button II)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy + 220, BTN_ICON_START,    "RUN Button (Start / Pause)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy + 264, BTN_ICON_SELECT,   "SELECT Button (In Games)", 0xFFFFFFFFu);
-            ps3_draw_btn_label(lx + 28, cy + 308, BTN_ICON_L2,       "+ R2  (or L3+R3 / SELECT+START) : In-Game Quick Menu", 0xFFFFB870u);
-            ps3_draw_btn_label(lx + 28, cy + 352, BTN_ICON_L1,       "/ R1  : Previous / Next Tab in Frontend", 0xFF8CE8FFu);
-            ps3_draw_text(lx + 28, cy + 396, 0xFF7CE8FFu, 1, "6-Button Arcade: Square=LP, Triangle=MP, R1=HP, Cross=LK, Circle=MK, R2=HK");
-            ps3_draw_text(lx + 28, cy + 420, 0xFF9AC2FAu, 1, "Fighting Games: Auto-detected (SF2, Garou, Fatal Fury, Art of Fighting, etc.)");
+            ps3_draw_btn_label(lx + 28, cy +  38, BTN_ICON_CIRCLE,   "Button I  (Primary Action / Confirm)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy +  76, BTN_ICON_CROSS,    "Button II (Secondary Action / Jump)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy + 114, BTN_ICON_TRIANGLE, "Turbo I   (Rapid Fire Button I)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy + 152, BTN_ICON_SQUARE,   "Turbo II  (Rapid Fire Button II)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy + 190, BTN_ICON_START,    "RUN Button (Start / Pause)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy + 228, BTN_ICON_SELECT,   "SELECT Button (In Games)", 0xFFFFFFFFu);
+            ps3_draw_btn_label(lx + 28, cy + 266, btn_id_to_icon(g_cfg.map_fastforward), "Tap/Hold Fast Forward (Turbo Speed 2x-5x)", 0xFFFFDD66u);
+            ps3_draw_btn_label(lx + 28, cy + 304, BTN_ICON_L2,       "+ R2  (or L3+R3 / SELECT+START) : Quick Menu", 0xFFFFB870u);
+            ps3_draw_btn_label(lx + 28, cy + 342, BTN_ICON_L1,       "/ R1  : Previous / Next Tab in Frontend", 0xFF8CE8FFu);
+            ps3_draw_text(lx + 28, cy + 380, 0xFF7CE8FFu, 1, "6-Button Arcade: Square=LP, Triangle=MP, R1=HP, Cross=LK, Circle=MK, R2=HK");
+            ps3_draw_text(lx + 28, cy + 404, 0xFF9AC2FAu, 1, "Fully Customizable: Remap any button & choose presets in Settings Tab");
+            ps3_draw_text(lx + 28, cy + 428, 0xFF8CE8FFu, 1, "Fighting Games: Auto-detected (SF2, Garou, Fatal Fury, Art of Fighting, etc.)");
 
             ps3_draw_panel(rx, content_y, rw, content_h, 0xEC0E1B34u, 0xEC081122u, 0xFF2B4F88u);
             ps3_draw_text_shadow(rx + 24, content_y + 14, 0xFFFF9E3Du, 2, "AUTHORS & CREDITS");
             ps3_draw_hline(rx + 20, content_y + 46, rw - 40, 0xFF244374u);
 
-            ps3_draw_text_shadow(rx + 24, content_y + 58, 0xFFFFFFFFu, 2, "PCE-PS3  v1.0  (Hu-Go! Core)");
+            ps3_draw_text_shadow(rx + 24, content_y + 58, 0xFFFFFFFFu, 2, "PCE-PS3  v1.02  (Hu-Go! Core)");
             ps3_draw_text(rx + 24, content_y + 90, 0xFFFFB870u, 1, "PlayStation 3 Port by theheroGAC (2026)");
             ps3_draw_text(rx + 24, content_y + 116, 0xFF8CE8FFu, 1, "PSL1GHT Modern SDK Integration");
             ps3_draw_text(rx + 24, content_y + 144, 0xFFDCE8FCu, 1, "- 48 kHz Stereo Audio Driver with Ring Buffer");

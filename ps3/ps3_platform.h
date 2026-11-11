@@ -6,7 +6,7 @@
 #include "ps3_btn_icons.h"
 
 #define PS3_APP_NAME        "PCE-PS3"
-#define PS3_APP_VERSION     "1.0"
+#define PS3_APP_VERSION     "1.02"
 #define PS3_TITLE_ID        "PCE4PS300"
 
 #define PS3_DATA_ROOT       "/dev_hdd0/pce4ps3"
@@ -79,6 +79,23 @@ enum {
 };
 
 enum {
+    PS3_BTN_NONE = 0,
+    PS3_BTN_CROSS,
+    PS3_BTN_CIRCLE,
+    PS3_BTN_SQUARE,
+    PS3_BTN_TRIANGLE,
+    PS3_BTN_L1,
+    PS3_BTN_R1,
+    PS3_BTN_L2,
+    PS3_BTN_R2,
+    PS3_BTN_L3,
+    PS3_BTN_R3,
+    PS3_BTN_START,
+    PS3_BTN_SELECT,
+    PS3_BTN_MAX
+};
+
+enum {
     PCE_MEDIA_HUCARD = 0,
     PCE_MEDIA_SGX = 1,
     PCE_MEDIA_CDROM = 2,
@@ -94,6 +111,18 @@ typedef struct {
     int audio_volume;
     int show_fps;
     int six_button_pad;
+    int map_btn_i;
+    int map_btn_ii;
+    int map_turbo_i;
+    int map_turbo_ii;
+    int map_btn_iii;
+    int map_btn_iv;
+    int map_btn_v;
+    int map_btn_vi;
+    int map_run;
+    int map_select;
+    int map_fastforward;
+    int fast_forward_speed;
     char bios_name[256];
     char last_rom_dir[512];
 } ps3_config_t;
@@ -101,6 +130,13 @@ typedef struct {
 extern ps3_config_t g_cfg;
 extern volatile int g_xmb_menu_open;
 extern int ROM_size;
+extern char g_rom_base[256];
+extern char g_active_rom_path[512];
+extern volatile int g_fast_forward_active;
+const char *ps3_btn_name(int btn_id);
+int  ps3_load_rom_preview(const char *rom_base, const char *full_path, uint32_t *out_argb, int dst_w, int dst_h);
+void ps3_save_rom_preview(const char *rom_base);
+void run_controller_remap_modal(void);
 
 void ps3_log_init(void);
 void ps3_log_close(void);
@@ -124,6 +160,7 @@ void ps3_video_render_game_to_fb(int src_w, int src_h);
 void ps3_video_present_game_frame(int src_w, int src_h);
 void ps3_video_capture_thumb(uint32_t *dst_argb, int dst_w, int dst_h);
 void ps3_video_toast(const char *msg, int frames);
+void ps3_video_progress(int percent, const char *label);
 void ps3_take_screenshot(void);
 extern volatile int g_take_screenshot_pending;
 
@@ -160,7 +197,7 @@ void ps3_draw_text_clipped(int x, int y, int max_w, uint32_t argb, int scale, co
 int  ps3_text_width(int scale, const char *text);
 void ps3_draw_pce_background(const char *subtitle_right);
 void ps3_draw_footer_buttons(const int *btns, const char **labels, int count);
-void ps3_draw_media_card(int x, int y, int w, int h, const char *title, int media_type, const char *badge_str);
+void ps3_draw_media_card(int x, int y, int w, int h, const char *title, int media_type, const char *badge_str, const uint32_t *thumb_argb);
 void ps3_draw_thumb_box(int x, int y, int w, int h, const uint32_t *pixels, int pw, int ph, const char *empty_label);
 void ps3_draw_boot_splash(const char *status_line, int step_pct);
 void ps3_show_error_dialog(const char *title, const char *msg1, const char *msg2);
@@ -169,6 +206,7 @@ int  ps3_validate_pce_file(const char *path);
 int  ps3_audio_init(void);
 void ps3_audio_shutdown(void);
 void ps3_audio_pause(int paused);
+void ps3_audio_push_frame(int frames);
 
 uint32_t ps3_pad_poll_menu(uint32_t *out_pressed);
 void     ps3_pad_poll_game(unsigned char joy_out[10]);

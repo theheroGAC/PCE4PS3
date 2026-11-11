@@ -18,6 +18,7 @@
 #define SOUND 1
 #define SDL 1
 #define ENABLE_TRACING 0
+#define USE_INSTR_SWITCH 1
 
 #define HAVE_STDINT_H 1
 #define HAVE_STDLIB_H 1

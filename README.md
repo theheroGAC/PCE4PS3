@@ -49,10 +49,12 @@ Supported media file formats:
     - **4:3 Standard** (Classic CRT television ratio with crisp pillarboxes)
     - **Pixel-Perfect** (Integer scaling matching native HuC6270 display registers)
     - **16:9 Widescreen** (Full 1080p widescreen fill)
-  - Video scaling filters: **Nearest Crisp** (sharp retro pixels), **Bilinear Smooth**, and **Anisotropic / Sharp**.
+  - Video scaling filters: **Nearest (Crisp)** (sharp retro integer pixels), **Linear (Smooth)** (bilinear filtering), and **Sharp Bilinear** (anisotropic sharp edges). Filters are applied dynamically in real-time during live gameplay and inside the in-game quick menu.
   - CRT Scanlines overlay simulation option.
   - Real-time on-screen FPS counter.
-  - **In-Game Screenshot Capture**: Instant one-click screenshot capture via the In-Game Quick Menu, saving uncompressed 24-bit full-resolution BMP images to `/dev_hdd0/pce4ps3/screenshots/` with on-screen notification.
+  - **In-Game Screenshot & Live ROM Preview**: Instant one-click screenshot capture via the In-Game Quick Menu. Automatically saves uncompressed 24-bit full-resolution BMP images to `/dev_hdd0/pce4ps3/screenshots/` and generates preview thumbnails for the Library HuCard / CD media card (`/dev_hdd0/pce4ps3/previews/<rom_base>.bmp`).
+  - **Fast Forward Turbo Speed**: Hold **R2** (or configured button) during gameplay to accelerate emulation at 2x, 3x, 4x, or 5x speed with an on-screen `>> FAST FORWARD` HUD indicator.
+  - **Controller Remapping & Presets**: Dedicated controller remapping modal available in both Settings tab and Quick Menu. Remap any DualShock 3 button to Button I, II, Turbo I, Turbo II, Run, Select, Fast Forward, or 6-button arcade punches/kicks. One-click presets include PC Engine Standard, Modern/SNES, and 6-Button Arcade.
 
 - **DualShock 3 Gamepad & Avenue Pad 6 (6-Button) Support**:
   - Full support for the official NEC **Avenue Pad 6** 6-button controller protocol with 4-scan state machine, auto-detected for all fighting games (*Street Fighter II'*, *Fatal Fury*, *Garou Densetsu*, *Art of Fighting*, *World Heroes*, *Flash Hiders*, *Advanced V.G.*, *Kabuki Ittouryoudan*, *Martial Champion*, *Strip Fighter II*, *Asuka 120%*, etc.) and toggleable in Settings and Quick Menu (`Auto (Fighting Games)`, `6-Button Arcade`, `2-Button Standard`).
@@ -112,9 +114,10 @@ Supported media file formats:
 | **Square (or Circle)** | Turbo Button II (Rapid Fire) |
 | **START** | RUN Button (Start / Pause) |
 | **SELECT** | SELECT Button (PC Engine) |
+| **R2** | Fast Forward (Hold to accelerate emulation 2x–5x) |
 | **R1** | Dedicated Turbo Fire Button I |
 | **L1** | Dedicated Turbo Fire Button II |
-| **L2 + R2** | In-Game Quick Menu (Save/Load State, Reset, Exit) |
+| **L2 + R2** | In-Game Quick Menu (Save/Load State, Reset, Screenshot, Remap, Exit) |
 | **L3 + R3** | Alternative In-Game Quick Menu Shortcut |
 | **SELECT + START** | Classic In-Game Quick Menu Shortcut |
 | **Clean Exit to XMB** | Navigate to the last tab **`CREDITS & EXIT`** and press **Cross (X)**, or select **`Exit PCE-PS3 (Return to XMB)`** from the In-Game Quick Menu or Settings tab. The `SELECT` button is never used for exiting, avoiding any accidental exit during gameplay or navigation. |

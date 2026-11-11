@@ -81,7 +81,7 @@ int osd_init_machine(void)
     silent = 0;
     host.sound.stereo       = 1;
     host.sound.signed_sound = 1;
-    host.sound.freq         = 22050;
+    host.sound.freq         = 48000;
     host.sound.sample_size  = 1;
     sound_driver            = 1;
     SetPalette();
@@ -175,8 +175,7 @@ void osd_gfx_set_color(UChar index, UChar r, UChar g, UChar b)
 
 void osd_gfx_set_message(char *mess)
 {
-    if (!mess || !mess[0] || strcasecmp(mess, "UNKNOWN ROM") == 0) return;
-    ps3_video_toast(mess, 120);
+    (void)mess;
 }
 
 static void osd_gfx_put_image_normal(void)
@@ -189,6 +188,7 @@ static void osd_gfx_put_image_normal(void)
     if (XBuf) {
         osd_gfx_buffer = XBuf + 32 + 64 * XBUF_WIDTH;
     }
+
     ps3_video_present_game_frame(w, h);
     ps3_check_sysutil();
     if (g_take_screenshot_pending) {
@@ -209,15 +209,19 @@ void osd_shutdown_input(void)
 
 int osd_keyboard(void)
 {
-    ps3_check_sysutil();
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            ps3_return_to_xmb();
+    static unsigned int s_ff_div = 0;
+    if (!g_fast_forward_active || (s_ff_div++ & 3u) == 0) {
+        ps3_check_sysutil();
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                ps3_return_to_xmb();
+            }
         }
     }
 
     if (g_app_should_quit) {
+        UPeriod = 0;
         return 1;
     }
 
@@ -229,6 +233,7 @@ int osd_keyboard(void)
     }
 
     if (ps3_pad_ingame_combo_triggered()) {
+        UPeriod = 0;
         ps3_audio_pause(1);
         int quit = ps3_ingame_menu_run();
         ps3_audio_pause(0);
@@ -237,6 +242,17 @@ int osd_keyboard(void)
             return 1;
         }
     }
+
+    if (g_fast_forward_active) {
+        int spd = g_cfg.fast_forward_speed;
+        if (spd < 2) spd = 2;
+        if (spd > 5) spd = 5;
+        UPeriod = spd - 1;
+        interrupt_60hz();
+    } else {
+        UPeriod = 0;
+    }
+
     return (g_emu_quit_to_browser || g_app_should_quit) ? 1 : 0;
 }
 
