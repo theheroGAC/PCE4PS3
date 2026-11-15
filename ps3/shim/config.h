@@ -11,6 +11,7 @@
 #define SIZEOF_LONG_INT 8
 
 #define WORDS_BIGENDIAN 1
+#define PS3 1
 #define KERNEL_DS 1
 #define NEW_GFX_ENGINE 1
 #define BSD_CD_HARDWARE_SUPPORT 1

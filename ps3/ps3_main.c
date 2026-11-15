@@ -50,6 +50,7 @@ static void reset_fast_forward_state(int wait_release)
     s_ff_had_combo        = 0;
     s_ff_press_us         = 0;
     g_fast_forward_active = 0;
+    g_ps3_ff_skip_draw    = 0;
     s_pacer_target_us     = 0;
 }
 
@@ -1223,6 +1224,11 @@ void ps3_frame_hook(void)
 {
     if (g_fast_forward_active) {
         ps3_audio_push_frame(1);
+        interrupt_60hz();
+        if (ps3_pad_ingame_combo_triggered()) {
+            g_ps3_ff_skip_draw = 0;
+            ps3_ingame_menu_run();
+        }
         s_pacer_target_us = 0;
         return;
     }
@@ -1238,9 +1244,9 @@ void ps3_frame_hook(void)
     }
 
     {
-        uint64_t interval = 16666ULL;
+        uint64_t interval = 16667ULL;
         uint64_t now = ps3_now_us();
-        if (s_pacer_target_us == 0 || now > s_pacer_target_us + 100000ULL) {
+        if (s_pacer_target_us == 0 || now > s_pacer_target_us + interval) {
             s_pacer_target_us = now + interval;
         } else {
             if (now < s_pacer_target_us) {
@@ -1374,27 +1380,80 @@ static void scan_directory_browser(const char *dir_path)
     }
 }
 
-static void scan_library_folder_recursive(const char *dir_path, int depth)
+static int          s_scan_aborted = 0;
+static unsigned int s_scan_tick    = 0;
+
+static int check_scan_cancel_button(int pct)
 {
-    if (depth > 2 || g_lib_count >= MAX_ENTRIES) return;
+    if (s_scan_aborted) return 1;
+    ps3_check_sysutil();
+    if (g_app_should_quit) {
+        s_scan_aborted = 1;
+        return 1;
+    }
+
+    padInfo padinfo;
+    padData paddata;
+    if (ioPadGetInfo(&padinfo) == 0) {
+        for (int p = 0; p < MAX_PADS; p++) {
+            if (!padinfo.status[p]) continue;
+            if (ioPadGetData(p, &paddata) == 0 && paddata.len >= 8) {
+                if (paddata.BTN_CIRCLE || paddata.BTN_CROSS ||
+                    paddata.BTN_START  || paddata.BTN_SELECT) {
+                    s_scan_aborted = 1;
+                    ps3_draw_boot_splash("SCAN SKIPPED BY USER...", 100);
+                    return 1;
+                }
+            }
+            break;
+        }
+    }
+
+    if ((s_scan_tick & 31u) == 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "SCANNING GAMES (%d FOUND) - PRESS CIRCLE OR CROSS TO SKIP", g_lib_count);
+        ps3_draw_boot_splash(msg, pct);
+    }
+    return 0;
+}
+
+static void scan_library_folder_recursive(const char *dir_path, int depth, int pct)
+{
+    if (s_scan_aborted || depth > 2 || g_lib_count >= MAX_ENTRIES) return;
+    if (check_scan_cancel_button(pct)) return;
+
     DIR *d = opendir(dir_path);
     if (!d) return;
 
     struct dirent *de;
     while ((de = readdir(d)) != NULL && g_lib_count < MAX_ENTRIES) {
         if (de->d_name[0] == '.') continue;
+        s_scan_tick++;
+        if ((s_scan_tick & 15u) == 0 && check_scan_cancel_button(pct)) {
+            break;
+        }
+
+        int mtype = detect_media_type(de->d_name);
+        if (de->d_type == DT_REG && mtype < 0) continue;
+
         char full[512];
         snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
+
+        if (de->d_type == DT_DIR) {
+            scan_library_folder_recursive(full, depth + 1, pct);
+            if (s_scan_aborted) break;
+            continue;
+        }
 
         struct stat st;
         if (stat(full, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            scan_library_folder_recursive(full, depth + 1);
+            scan_library_folder_recursive(full, depth + 1, pct);
+            if (s_scan_aborted) break;
             continue;
         }
 
-        int mtype = detect_media_type(de->d_name);
         if (mtype < 0) continue;
 
         int dup = 0;
@@ -1428,14 +1487,20 @@ static void rebuild_library_filter(void)
     }
 }
 
-static void scan_usb_root_files(const char *root_path)
+static void scan_usb_root_files(const char *root_path, int pct)
 {
-    if (g_lib_count >= MAX_ENTRIES) return;
+    if (s_scan_aborted || g_lib_count >= MAX_ENTRIES) return;
+    if (check_scan_cancel_button(pct)) return;
+
     DIR *d = opendir(root_path);
     if (!d) return;
     struct dirent *de;
     while ((de = readdir(d)) != NULL && g_lib_count < MAX_ENTRIES) {
         if (de->d_name[0] == '.') continue;
+        s_scan_tick++;
+        if ((s_scan_tick & 15u) == 0 && check_scan_cancel_button(pct)) {
+            break;
+        }
         int mtype = detect_media_type(de->d_name);
         if (mtype < 0) continue;
         char full[512];
@@ -1464,37 +1529,54 @@ static void scan_usb_root_files(const char *root_path)
 
 static void rescan_all_library_sources(void)
 {
-    g_lib_count = 0;
-    scan_library_folder_recursive(PS3_ROMS_DIR, 0);
-    scan_library_folder_recursive("/dev_hdd0/ROMS/pce", 0);
-    scan_library_folder_recursive("/dev_hdd0/roms/pce", 0);
-    scan_library_folder_recursive(PS3_PKG_USRDIR "/roms", 0);
+    g_lib_count    = 0;
+    s_scan_aborted = 0;
+    s_scan_tick    = 0;
 
-    for (int u = 0; u < 4; u++) {
+    ps3_draw_boot_splash("SCANNING GAMES - PRESS CIRCLE OR CROSS TO SKIP...", 50);
+
+    scan_library_folder_recursive(PS3_ROMS_DIR, 0, 55);
+    scan_library_folder_recursive("/dev_hdd0/ROMS/pce", 0, 60);
+    scan_library_folder_recursive("/dev_hdd0/roms/pce", 0, 65);
+    scan_library_folder_recursive(PS3_PKG_USRDIR "/roms", 0, 70);
+
+    for (int u = 0; u < 4 && !s_scan_aborted; u++) {
         char uroot[64];
         snprintf(uroot, sizeof(uroot), "/dev_usb00%d", u);
         DIR *dcheck = opendir(uroot);
         if (!dcheck) continue;
         closedir(dcheck);
 
-        scan_usb_root_files(uroot);
+        int pct = 75 + u * 6;
+        scan_usb_root_files(uroot, pct);
         char upath[128];
         snprintf(upath, sizeof(upath), PS3_USB_ROMS_FMT, u);
-        scan_library_folder_recursive(upath, 0);
+        scan_library_folder_recursive(upath, 0, pct);
         snprintf(upath, sizeof(upath), PS3_USB_ROOT_FMT, u);
-        scan_library_folder_recursive(upath, 0);
+        scan_library_folder_recursive(upath, 0, pct);
         snprintf(upath, sizeof(upath), PS3_USB_ALT_FMT, u);
-        scan_library_folder_recursive(upath, 0);
+        scan_library_folder_recursive(upath, 0, pct);
         snprintf(upath, sizeof(upath), "/dev_usb00%d/ROMS", u);
-        scan_library_folder_recursive(upath, 0);
+        scan_library_folder_recursive(upath, 0, pct);
         snprintf(upath, sizeof(upath), "/dev_usb00%d/roms", u);
-        scan_library_folder_recursive(upath, 0);
+        scan_library_folder_recursive(upath, 0, pct);
     }
 
     if (g_lib_count > 1) {
         qsort(g_lib_entries, (size_t)g_lib_count, sizeof(file_entry_t), cmp_entries);
     }
     rebuild_library_filter();
+
+    if (s_scan_aborted) {
+        for (int i = 0; i < 12; i++) {
+            uint32_t dummy = 0;
+            uint32_t held = ps3_pad_poll_menu(&dummy);
+            if ((held & (PS3_ACT_CONFIRM | PS3_ACT_CANCEL | PS3_ACT_START | PS3_ACT_SELECT)) == 0) {
+                break;
+            }
+            sysUsleep(16000);
+        }
+    }
 }
 
 static int copy_file_binary(const char *src, const char *dst)
@@ -1520,22 +1602,24 @@ static int copy_file_binary(const char *src, const char *dst)
     return 0;
 }
 
+static int str_ends_with_ci(const char *s, const char *ext)
+{
+    size_t sl = strlen(s);
+    size_t el = strlen(ext);
+    if (sl < el) return 0;
+    return strcasecmp(s + sl - el, ext) == 0;
+}
+
 static int auto_import_bios_from_usb(char *out_status, size_t cap)
 {
-    static const char *bios_names[] = {
-        "syscard3.pce", "SYSCARD3.PCE",
-        "syscard2.pce", "SYSCARD2.PCE",
-        "syscard1.pce", "SYSCARD1.PCE",
-        "syscard.pce",  "SYSCARD.PCE",
-        "bios.pce",     "BIOS.PCE",
-        "games_express.pce",
-        NULL
-    };
     static const char *sub_dirs[] = {
         "", "/bios", "/BIOS", "/pce", "/PCE", "/roms/pce", "/pce4ps3/bios", NULL
     };
 
-    int imported = 0;
+    char best_v3_src[512] = "";
+    int  best_v3_score = 0;
+    int  imported = 0;
+
     for (int u = 0; u < 8; u++) {
         char uroot[64];
         snprintf(uroot, sizeof(uroot), "/dev_usb00%d", u);
@@ -1544,29 +1628,58 @@ static int auto_import_bios_from_usb(char *out_status, size_t cap)
         closedir(dcheck);
 
         for (int s = 0; sub_dirs[s]; s++) {
-            for (int b = 0; bios_names[b]; b++) {
+            char dir_buf[128];
+            snprintf(dir_buf, sizeof(dir_buf), "/dev_usb00%d%s", u, sub_dirs[s]);
+            DIR *d = opendir(dir_buf);
+            if (!d) continue;
+
+            int strict = (s == 0 || s == 3 || s == 4 || s == 5) ? 1 : 0;
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
                 char src[512];
-                snprintf(src, sizeof(src), "/dev_usb00%d%s/%s", u, sub_dirs[s], bios_names[b]);
-                struct stat st;
-                if (stat(src, &st) == 0 && st.st_size >= 8192) {
+                snprintf(src, sizeof(src), "%s/%s", dir_buf, de->d_name);
+                int score = ps3_score_syscard_file(src, strict);
+                if (score <= 0) continue;
+
+                const char *canon = NULL;
+                if (strncasecmp(de->d_name, "games_express", 13) == 0) {
+                    canon = "games_express.pce";
+                } else if (strncasecmp(de->d_name, "syscard1", 8) == 0) {
+                    canon = "syscard1.pce";
+                } else if (strncasecmp(de->d_name, "syscard2", 8) == 0) {
+                    canon = "syscard2.pce";
+                }
+
+                if (canon) {
                     char dst[512];
-                    const char *canon = (strncasecmp(bios_names[b], "syscard2", 8) == 0) ? "syscard2.pce"
-                                      : (strncasecmp(bios_names[b], "syscard1", 8) == 0) ? "syscard1.pce"
-                                      : (strncasecmp(bios_names[b], "bios", 4) == 0)     ? "bios.pce"
-                                      : "syscard3.pce";
                     snprintf(dst, sizeof(dst), "%s/%s", PS3_BIOS_DIR, canon);
                     if (copy_file_binary(src, dst) == 0) {
                         imported++;
                     }
                 }
+
+                if (score > best_v3_score) {
+                    best_v3_score = score;
+                    snprintf(best_v3_src, sizeof(best_v3_src), "%s", src);
+                }
             }
+            closedir(d);
+        }
+    }
+
+    if (best_v3_score > 0 && best_v3_src[0]) {
+        char dst[512];
+        snprintf(dst, sizeof(dst), "%s/syscard3.pce", PS3_BIOS_DIR);
+        if (copy_file_binary(best_v3_src, dst) == 0) {
+            imported++;
         }
     }
 
     if (imported > 0) {
         snprintf(out_status, cap, "Imported %d System Card BIOS file(s) to %s!", imported, PS3_BIOS_DIR);
     } else {
-        snprintf(out_status, cap, "No BIOS files found on USB (/dev_usb000..007). Place syscard3.pce on USB.");
+        snprintf(out_status, cap, "No BIOS found on USB. Supports syscard3.pce or [BIOS] Super CD-ROM System*.pce");
     }
     return imported;
 }
@@ -1585,14 +1698,18 @@ int ps3_validate_pce_file(const char *path)
     return 1;
 }
 
-static int find_sibling_cue(const char *bin_path, char *out, size_t cap)
+static int find_sibling_cue(const char *img_path, char *out, size_t cap)
 {
     char base[512];
+    char dir_path[512];
+    const char *fname;
+    char target_cue[256];
     char *dot;
+    char *slash;
     static const char *exts[] = { ".cue", ".CUE", NULL };
 
-    if (!bin_path || !out || cap == 0) return 0;
-    snprintf(base, sizeof(base), "%s", bin_path);
+    if (!img_path || !out || cap == 0) return 0;
+    snprintf(base, sizeof(base), "%s", img_path);
     dot = strrchr(base, '.');
     if (dot) *dot = '\0';
 
@@ -1605,6 +1722,35 @@ static int find_sibling_cue(const char *bin_path, char *out, size_t cap)
             return 1;
         }
     }
+
+    snprintf(dir_path, sizeof(dir_path), "%s", img_path);
+    slash = strrchr(dir_path, '/');
+    if (slash) {
+        *slash = '\0';
+        fname = slash + 1;
+    } else {
+        strcpy(dir_path, ".");
+        fname = img_path;
+    }
+    snprintf(target_cue, sizeof(target_cue), "%s", fname);
+    dot = strrchr(target_cue, '.');
+    if (dot && (size_t)(dot - target_cue) + 5 <= sizeof(target_cue)) {
+        strcpy(dot, ".cue");
+        DIR *d = opendir(dir_path);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                if (strcasecmp(de->d_name, target_cue) == 0 && str_ends_with_ci(de->d_name, ".cue")) {
+                    snprintf(out, cap, "%s/%s", dir_path, de->d_name);
+                    closedir(d);
+                    return 1;
+                }
+            }
+            closedir(d);
+        }
+    }
+
     out[0] = '\0';
     return 0;
 }
@@ -1628,15 +1774,16 @@ static void launch_selected_game(const char *selected_path)
     int is_bin = (dot && (strcasecmp(dot, ".bin") == 0 || strcasecmp(dot, ".img") == 0));
     int is_zip = (dot && strcasecmp(dot, ".zip") == 0);
 
-    if (is_bin) {
+    if (is_bin || is_iso) {
         char cue_path[512];
         if (find_sibling_cue(selected_path, cue_path, sizeof(cue_path))) {
             snprintf(actual_rom_path, sizeof(actual_rom_path), "%s", cue_path);
             ps3_log("CD: using CUE %s\n", cue_path);
             is_bin = 0;
+            is_iso = 0;
             is_cue = 1;
         } else {
-            ps3_log("CD: no sibling CUE, opening %s as ISO\n", selected_path);
+            ps3_log("CD: no sibling CUE, opening %s directly\n", selected_path);
         }
     }
 
@@ -1670,10 +1817,10 @@ static void launch_selected_game(const char *selected_path)
     char syscard_path[512] = {0};
     if (is_cue || is_iso || is_hcd || is_bin) {
         if (!ps3_find_syscard(syscard_path, sizeof(syscard_path))) {
-            ps3_log("CD-ROM2 game requested but syscard3.pce not found!\n");
-            ps3_show_error_dialog("MISSING SYSCARD3.PCE BIOS",
-                                  "CD-ROM2 titles require the syscard3.pce System Card BIOS.",
-                                  "Import it from the BIOS tab or place it on a USB flash drive.");
+            ps3_log("CD-ROM2 game requested but System Card BIOS not found!\n");
+            ps3_show_error_dialog("MISSING SYSTEM CARD BIOS",
+                                  "CD-ROM2 titles require a Super CD-ROM2 BIOS (.pce).",
+                                  "Import syscard3.pce or [BIOS] Super CD-ROM System*.pce in BIOS tab.");
             ps3_zip_cleanup_temp();
             return;
         }
@@ -1683,22 +1830,32 @@ static void launch_selected_game(const char *selected_path)
     int init_rc = -1;
     if (is_cue) {
         if (ps3_cue_load(actual_rom_path) == 0) {
-            CD_emulation = 2;
+            CD_emulation = 1;
             snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
-            init_rc = InitPCE(syscard_path, bram_file);
+            init_rc = InitPCE("", bram_file);
+        } else {
+            ps3_show_error_dialog("CD-ROM2 CUE ERROR",
+                                  "Failed to load the .cue sheet or its binary file.",
+                                  "Verify the .iso/.bin file matches the .cue sheet in the same folder.");
+            ps3_zip_cleanup_temp();
+            return;
         }
-    } else if (is_bin) {
-        CD_emulation = 2;
-        snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
-        init_rc = InitPCE(syscard_path, bram_file);
-    } else if (is_iso) {
-        CD_emulation = 2;
-        snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
-        init_rc = InitPCE(syscard_path, bram_file);
+    } else if (is_bin || is_iso) {
+        if (ps3_cd_open_image(actual_rom_path) == 0) {
+            CD_emulation = 1;
+            snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
+            init_rc = InitPCE("", bram_file);
+        } else {
+            ps3_show_error_dialog("CD-ROM2 IMAGE ERROR",
+                                  "Failed to open the .iso/.bin CD-ROM2 image.",
+                                  "If packaged as .rar/.7z, extract it first so .cue + .iso sit together.");
+            ps3_zip_cleanup_temp();
+            return;
+        }
     } else if (is_hcd) {
         CD_emulation = 5;
         snprintf(ISO_filename, sizeof(ISO_filename), "%s", actual_rom_path);
-        init_rc = InitPCE(syscard_path, bram_file);
+        init_rc = InitPCE(actual_rom_path, bram_file);
     } else {
         CD_emulation = 0;
         ISO_filename[0] = '\0';
@@ -1802,7 +1959,12 @@ static void run_main_frontend(void)
         strcpy(cur_dir, "/dev_hdd0");
         scan_directory_browser(cur_dir);
     }
-    rescan_all_library_sources();
+    if (g_cfg.auto_scan_startup) {
+        rescan_all_library_sources();
+    } else {
+        g_lib_count = 0;
+        rebuild_library_filter();
+    }
 
     char cached_syscard[512] = {0};
     int cached_has_bios = ps3_find_syscard(cached_syscard, sizeof(cached_syscard));
@@ -1950,7 +2112,7 @@ static void run_main_frontend(void)
                 s_cached_rom_preview_valid = 0;
             }
         } else if (active_tab == TAB_SETTINGS) {
-            const int cfg_rows = 12;
+            const int cfg_rows = 13;
             if (pressed & PS3_ACT_UP)   cfg_sel = (cfg_sel + cfg_rows - 1) % cfg_rows;
             if (pressed & PS3_ACT_DOWN) cfg_sel = (cfg_sel + 1) % cfg_rows;
             int left  = (pressed & PS3_ACT_LEFT)  != 0;
@@ -2007,9 +2169,15 @@ static void run_main_frontend(void)
                     if (left || right || enter) g_cfg.show_fps = !g_cfg.show_fps;
                     break;
                 case 10:
-                    if (enter) ps3_config_save();
+                    if (left || right || enter) {
+                        g_cfg.auto_scan_startup = !g_cfg.auto_scan_startup;
+                        ps3_config_save();
+                    }
                     break;
                 case 11:
+                    if (enter) ps3_config_save();
+                    break;
+                case 12:
                     if (enter) ps3_return_to_xmb();
                     break;
             }
@@ -2231,9 +2399,9 @@ static void run_main_frontend(void)
 
             int rx = px + 24;
             int rw = pw - 48;
-            int ry = content_y + 48;
-            int rh = 32;
-            int rg = 36;
+            int ry = content_y + 46;
+            int rh = 30;
+            int rg = 35;
 
             char vol_str[32];
             snprintf(vol_str, sizeof(vol_str), "%d%%", g_cfg.audio_volume);
@@ -2261,12 +2429,13 @@ static void run_main_frontend(void)
             ps3_draw_selector_row(rx, ry + 7 * rg, rw, rh, "Fast Forward Speed", ff_str, cfg_sel == 7);
             ps3_draw_selector_row(rx, ry + 8 * rg, rw, rh, "Controller Button Remapping...", remap_summary, cfg_sel == 8);
             ps3_draw_switch_row(rx,   ry + 9 * rg, rw, rh, "On-Screen FPS Counter", g_cfg.show_fps, cfg_sel == 9);
-
-            ps3_draw_card_row(rx, ry + 10 * rg, rw, rh, cfg_sel == 10);
-            ps3_draw_text_shadow(rx + 18, ry + 10 * rg + 7, (cfg_sel == 10) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Save Configuration to Disk (hugo.ini)");
+            ps3_draw_switch_row(rx,   ry + 10 * rg, rw, rh, "Auto-Scan Games on Startup", g_cfg.auto_scan_startup, cfg_sel == 10);
 
             ps3_draw_card_row(rx, ry + 11 * rg, rw, rh, cfg_sel == 11);
-            ps3_draw_text_shadow(rx + 18, ry + 11 * rg + 7, (cfg_sel == 11) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
+            ps3_draw_text_shadow(rx + 18, ry + 11 * rg + 6, (cfg_sel == 11) ? 0xFFFFB870u : 0xFFD0DEFAu, 2, "Save Configuration to Disk (hugo.ini)");
+
+            ps3_draw_card_row(rx, ry + 12 * rg, rw, rh, cfg_sel == 12);
+            ps3_draw_text_shadow(rx + 18, ry + 12 * rg + 6, (cfg_sel == 12) ? 0xFFFF5A6Au : 0xFFD0DEFAu, 2, "Exit PCE-PS3 (Return to XMB)");
 
             const int btns[] = { BTN_ICON_DPAD, BTN_ICON_CROSS, BTN_ICON_L1 };
             const char *lbls[] = { "Change Setting", "Toggle / Save", "Switch Tabs" };
@@ -2280,9 +2449,9 @@ static void run_main_frontend(void)
             ps3_draw_hline(px + 20, content_y + 46, pw - 40, 0xFF244374u);
 
             ps3_draw_card_row(px + 24, content_y + 64, pw - 48, 68, 1);
-            ps3_draw_text_shadow(px + 44, content_y + 74, 0xFFFFFFFFu, 2, "Super CD-ROM2 System Card (syscard3.pce)");
+            ps3_draw_text_shadow(px + 44, content_y + 74, 0xFFFFFFFFu, 2, "Super CD-ROM2 System Card (syscard3.pce / BIOS)");
             ps3_draw_text(px + 44, content_y + 102, 0xFF9AC2FAu, 1,
-                          cached_has_bios ? cached_syscard : "Not found in /dev_hdd0/pce4ps3/bios/syscard3.pce");
+                          cached_has_bios ? cached_syscard : "Not found in /dev_hdd0/pce4ps3/bios/ (syscard3.pce or [BIOS] Super CD-ROM...)");
             ps3_draw_badge(px + pw - 160, content_y + 84,
                            cached_has_bios ? "READY" : "MISSING",
                            cached_has_bios ? 0xFF167C52u : 0xFFB83828u, 0xFFFFFFFFu);
@@ -2301,7 +2470,7 @@ static void run_main_frontend(void)
             ps3_draw_text_shadow(px + 44, content_y + 340, 0xFFFF9E3Du, 2, "ONE-CLICK USB BIOS AUTO-IMPORTER");
             ps3_draw_text(px + 44, content_y + 376, 0xFFFFFFFFu, 1, bios_msg);
             ps3_draw_btn_label(px + 44, content_y + 416, BTN_ICON_TRIANGLE,
-                               "Scan USB Drives (/dev_usb000..007) & Import syscard3.pce Now", 0xFF7CE8FFu);
+                               "Scan USB Drives (/dev_usb000..007) & Import System Card BIOS Now", 0xFF7CE8FFu);
 
             const int btns[] = { BTN_ICON_TRIANGLE, BTN_ICON_L1 };
             const char *lbls[] = { "Auto-Import BIOS from USB", "Switch Tabs" };
@@ -2336,7 +2505,7 @@ static void run_main_frontend(void)
             ps3_draw_text_shadow(rx + 24, content_y + 14, 0xFFFF9E3Du, 2, "AUTHORS & CREDITS");
             ps3_draw_hline(rx + 20, content_y + 46, rw - 40, 0xFF244374u);
 
-            ps3_draw_text_shadow(rx + 24, content_y + 58, 0xFFFFFFFFu, 2, "PCE-PS3  v1.02  (Hu-Go! Core)");
+            ps3_draw_text_shadow(rx + 24, content_y + 58, 0xFFFFFFFFu, 2, "PCE-PS3  v1.03  (Hu-Go! Core)");
             ps3_draw_text(rx + 24, content_y + 90, 0xFFFFB870u, 1, "PlayStation 3 Port by theheroGAC (2026)");
             ps3_draw_text(rx + 24, content_y + 116, 0xFF8CE8FFu, 1, "PSL1GHT Modern SDK Integration");
             ps3_draw_text(rx + 24, content_y + 144, 0xFFDCE8FCu, 1, "- 48 kHz Stereo Audio Driver with Ring Buffer");

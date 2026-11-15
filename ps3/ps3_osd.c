@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "pce.h"
 #include "gfx.h"
@@ -178,8 +179,11 @@ void osd_gfx_set_message(char *mess)
     (void)mess;
 }
 
+int g_ps3_ff_skip_draw = 0;
+
 static void osd_gfx_put_image_normal(void)
 {
+    static unsigned int s_ff_skip_cnt = 0;
     int w = io.screen_w > 0 ? io.screen_w : 256;
     int h = io.screen_h > 0 ? io.screen_h : 224;
     if (!XBuf) {
@@ -189,11 +193,27 @@ static void osd_gfx_put_image_normal(void)
         osd_gfx_buffer = XBuf + 32 + 64 * XBUF_WIDTH;
     }
 
-    ps3_video_present_game_frame(w, h);
-    ps3_check_sysutil();
-    if (g_take_screenshot_pending) {
-        g_take_screenshot_pending = 0;
-        ps3_take_screenshot();
+    if (!g_ps3_ff_skip_draw) {
+        ps3_video_present_game_frame(w, h);
+    }
+
+    if (g_fast_forward_active) {
+        int spd = g_cfg.fast_forward_speed;
+        if (spd < 2) spd = 2;
+        if (spd > 5) spd = 5;
+        s_ff_skip_cnt++;
+        g_ps3_ff_skip_draw = ((s_ff_skip_cnt % (unsigned int)spd) != 0) ? 1 : 0;
+    } else {
+        s_ff_skip_cnt = 0;
+        g_ps3_ff_skip_draw = 0;
+    }
+
+    if (!g_ps3_ff_skip_draw) {
+        ps3_check_sysutil();
+        if (g_take_screenshot_pending) {
+            g_take_screenshot_pending = 0;
+            ps3_take_screenshot();
+        }
     }
     ps3_frame_hook();
 }
@@ -209,19 +229,22 @@ void osd_shutdown_input(void)
 
 int osd_keyboard(void)
 {
-    static unsigned int s_ff_div = 0;
-    if (!g_fast_forward_active || (s_ff_div++ & 3u) == 0) {
-        ps3_check_sysutil();
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) {
-                ps3_return_to_xmb();
-            }
+    if (g_ps3_ff_skip_draw) {
+        UPeriod = 0;
+        return (g_emu_quit_to_browser || g_app_should_quit) ? 1 : 0;
+    }
+
+    ps3_check_sysutil();
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            ps3_return_to_xmb();
         }
     }
 
     if (g_app_should_quit) {
         UPeriod = 0;
+        g_ps3_ff_skip_draw = 0;
         return 1;
     }
 
@@ -234,6 +257,7 @@ int osd_keyboard(void)
 
     if (ps3_pad_ingame_combo_triggered()) {
         UPeriod = 0;
+        g_ps3_ff_skip_draw = 0;
         ps3_audio_pause(1);
         int quit = ps3_ingame_menu_run();
         ps3_audio_pause(0);
@@ -243,18 +267,13 @@ int osd_keyboard(void)
         }
     }
 
-    if (g_fast_forward_active) {
-        int spd = g_cfg.fast_forward_speed;
-        if (spd < 2) spd = 2;
-        if (spd > 5) spd = 5;
-        UPeriod = spd - 1;
-        interrupt_60hz();
-    } else {
-        UPeriod = 0;
-    }
+    UPeriod = 0;
 
     return (g_emu_quit_to_browser || g_app_should_quit) ? 1 : 0;
 }
+
+extern UChar *cd_buf;
+extern UInt32 first_sector;
 
 void osd_cd_read(UChar *p, UInt32 s)
 {
@@ -278,8 +297,8 @@ void osd_cd_play_audio_track(UChar track)
 void osd_cd_play_audio_range(UChar min_from, UChar sec_from, UChar fra_from,
                              UChar min_to,   UChar sec_to,   UChar fra_to)
 {
-    (void)min_from; (void)sec_from; (void)fra_from;
-    (void)min_to;   (void)sec_to;   (void)fra_to;
+    ps3_cue_play_cdda_range((int)min_from, (int)sec_from, (int)fra_from,
+                            (int)min_to,   (int)sec_to,   (int)fra_to, 0);
 }
 
 void osd_cd_nb_tracks(int *first, int *last)
@@ -290,9 +309,7 @@ void osd_cd_nb_tracks(int *first, int *last)
 
 void osd_cd_length(int *min, int *sec, int *fra)
 {
-    if (min) *min = 60;
-    if (sec) *sec = 0;
-    if (fra) *fra = 0;
+    ps3_cue_get_disc_length(min, sec, fra);
 }
 
 void osd_cd_track_info(UChar track, int *min, int *sec, int *fra, int *control)
@@ -306,30 +323,53 @@ void osd_cd_track_info(UChar track, int *min, int *sec, int *fra, int *control)
 
 void osd_cd_subchannel_info(unsigned short offset)
 {
-    Wr6502(offset, 0);
+    uint8_t subq[10];
+    ps3_cue_get_subchannel_info(subq);
+    for (int i = 0; i < 10; i++) {
+        Wr6502((UInt16)(offset + i), subq[i]);
+    }
 }
 
 void osd_cd_status(int *status)
 {
-    if (status) *status = 0;
+    if (status) *status = ps3_cue_get_cdda_status();
 }
 
 int osd_cd_init(char *device)
 {
-    (void)device;
+    ps3_cue_stop_cdda();
+    if (cd_buf) {
+        free(cd_buf);
+        cd_buf = NULL;
+    }
+    first_sector = 0;
+
+    if (!ps3_cue_is_loaded() && device && device[0]) {
+        const char *dot = strrchr(device, '.');
+        if (dot && strcasecmp(dot, ".cue") == 0) {
+            return ps3_cue_load(device);
+        }
+        return ps3_cd_open_image(device);
+    }
     return 0;
 }
 
 void osd_cd_close(void)
 {
     ps3_cue_stop_cdda();
+    if (cd_buf) {
+        free(cd_buf);
+        cd_buf = NULL;
+    }
+    first_sector = 0;
 }
 
 void osd_cd_resume(void)
 {
+    ps3_cue_pause_cdda(0);
 }
 
 void osd_cd_pause(void)
 {
-    ps3_cue_stop_cdda();
+    ps3_cue_pause_cdda(1);
 }

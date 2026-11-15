@@ -86,6 +86,7 @@ COMMON_WARN := \
 	-Wno-switch
 
 COMMON_DEFS := \
+	-DPS3 \
 	-D__PS3__ \
 	-DPS3_PORT \
 	-DWORDS_BIGENDIAN=1 \
@@ -99,7 +100,7 @@ BASE_CFLAGS := -O2 -mcpu=cell -std=gnu99 -fcommon -fno-strict-aliasing -fsigned-
 HUGO_CFLAGS := $(BASE_CFLAGS) -include $(SHIM_DIR)/prelude.h
 PS3_CFLAGS  := $(BASE_CFLAGS) -include $(SHIM_DIR)/prelude.h
 
-LDFLAGS := $(MACHDEP) -L$(PSL1GHT)/ppu/lib -L$(PORTLIBS)/lib -L$(PS3DEV)/ppu/lib
+LDFLAGS := $(MACHDEP) -Wl,--wrap=rsxSetTransferScaleSurface -L$(PSL1GHT)/ppu/lib -L$(PORTLIBS)/lib -L$(PS3DEV)/ppu/lib
 
 LIBS := \
 	-lSDL2_ttf \

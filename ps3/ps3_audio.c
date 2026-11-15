@@ -16,18 +16,26 @@ extern void write_adpcm(void);
 
 extern SInt32 smode;
 extern SChar silent;
+extern UInt32 CycleOld;
+extern UInt32 CycleNew;
+extern UInt32 dwNewPos;
 
 #define SND_RATE          PS3_AUDIO_RATE
 #define SND_RING_FRAMES   16384u
 #define SND_RING_MASK     (SND_RING_FRAMES - 1u)
 #define SND_BLOCK_FRAMES  PS3_AUDIO_BLOCK
-#define SND_TARGET        2048u
+#define SND_TARGET        3072u
+#define SND_PRIME_MIN     1600u
 #define SND_PUSH_MAX      2048
 
 static int16_t          s_ring[SND_RING_FRAMES * 2];
 static volatile unsigned s_wr = 0;
 static volatile unsigned s_rd = 0;
 static volatile int      s_stopped = 1;
+static volatile int      s_primed = 0;
+static uint32_t          s_frac_fp = 0;
+static float             s_last_l = 0.0f;
+static float             s_last_r = 0.0f;
 
 static u32               g_port = 0xFFFFFFFFu;
 static audioPortConfig   g_port_cfg;
@@ -39,11 +47,14 @@ static int               g_audio_inited = 0;
 
 static void audio_fill_block(float *out)
 {
-    unsigned rp, wp, used, n, i;
+    unsigned rp, wp, used, i;
 
     if (!out) return;
 
     if (s_stopped) {
+        s_last_l = 0.0f;
+        s_last_r = 0.0f;
+        s_frac_fp = 0;
         memset(out, 0, (size_t)SND_BLOCK_FRAMES * 2 * sizeof(float));
         return;
     }
@@ -52,31 +63,80 @@ static void audio_fill_block(float *out)
     rp = s_rd;
     used = wp - rp;
 
-    if (used == 0) {
-        memset(out, 0, (size_t)SND_BLOCK_FRAMES * 2 * sizeof(float));
-        return;
-    }
-
-    n = used < SND_BLOCK_FRAMES ? used : SND_BLOCK_FRAMES;
-
-    if (used > SND_TARGET + 512) rp += 2;
-    else if (used + 512 < SND_TARGET && n > 2) n -= 2;
-
-    for (i = 0; i < n; i++) {
-        unsigned idx = (rp + i) & SND_RING_MASK;
-        out[i * 2 + 0] = (float)s_ring[idx * 2 + 0] * (1.0f / 32768.0f);
-        out[i * 2 + 1] = (float)s_ring[idx * 2 + 1] * (1.0f / 32768.0f);
-    }
-
-    if (n < SND_BLOCK_FRAMES) {
-        for (i = n; i < SND_BLOCK_FRAMES; i++) {
-            out[i * 2 + 0] = 0.0f;
-            out[i * 2 + 1] = 0.0f;
+    if (!s_primed) {
+        if (used >= SND_PRIME_MIN) {
+            s_primed = 1;
+            s_frac_fp = 0;
+        } else {
+            s_last_l = 0.0f;
+            s_last_r = 0.0f;
+            memset(out, 0, (size_t)SND_BLOCK_FRAMES * 2 * sizeof(float));
+            return;
         }
     }
 
-    __sync_synchronize();
-    s_rd = rp + n;
+    if (used >= SND_BLOCK_FRAMES + 12u) {
+        int32_t err = (int32_t)used - (int32_t)SND_TARGET;
+        uint32_t step_fp = 65536u;
+        if (err >= 320) {
+            int32_t delta = (err - 320) >> 1;
+            if (delta > 1024) delta = 1024;
+            step_fp = 65536u + (uint32_t)delta;
+        } else if (err <= -320) {
+            int32_t delta = (-err - 320) >> 1;
+            if (delta > 1024) delta = 1024;
+            step_fp = 65536u - (uint32_t)delta;
+        }
+
+        uint32_t inp = 0;
+        for (i = 0; i < SND_BLOCK_FRAMES; i++) {
+            uint32_t p0 = inp;
+            uint32_t p1 = inp + 1u;
+            if (p1 >= used) {
+                p1 = used - 1u;
+                if (p0 >= used) p0 = used - 1u;
+            }
+            unsigned idx0 = (rp + p0) & SND_RING_MASK;
+            unsigned idx1 = (rp + p1) & SND_RING_MASK;
+            float frac = (float)s_frac_fp * (1.0f / 65536.0f);
+            float l0 = (float)s_ring[idx0 * 2u + 0u] * (1.0f / 32768.0f);
+            float r0 = (float)s_ring[idx0 * 2u + 1u] * (1.0f / 32768.0f);
+            float l1 = (float)s_ring[idx1 * 2u + 0u] * (1.0f / 32768.0f);
+            float r1 = (float)s_ring[idx1 * 2u + 1u] * (1.0f / 32768.0f);
+            s_last_l = l0 + (l1 - l0) * frac;
+            s_last_r = r0 + (r1 - r0) * frac;
+            out[i * 2u + 0u] = s_last_l;
+            out[i * 2u + 1u] = s_last_r;
+            s_frac_fp += step_fp;
+            inp += (s_frac_fp >> 16);
+            s_frac_fp &= 0xFFFFu;
+        }
+        if (inp > used) inp = used;
+        __sync_synchronize();
+        s_rd = rp + inp;
+        return;
+    }
+
+    for (i = 0; i < used && i < SND_BLOCK_FRAMES; i++) {
+        unsigned idx = (rp + i) & SND_RING_MASK;
+        s_last_l = (float)s_ring[idx * 2u + 0u] * (1.0f / 32768.0f);
+        s_last_r = (float)s_ring[idx * 2u + 1u] * (1.0f / 32768.0f);
+        out[i * 2u + 0u] = s_last_l;
+        out[i * 2u + 1u] = s_last_r;
+    }
+    for (; i < SND_BLOCK_FRAMES; i++) {
+        s_last_l *= 0.992f;
+        s_last_r *= 0.992f;
+        out[i * 2u + 0u] = s_last_l;
+        out[i * 2u + 1u] = s_last_r;
+    }
+
+    s_frac_fp = 0;
+    if (used > 0) {
+        unsigned take = (used < SND_BLOCK_FRAMES) ? used : SND_BLOCK_FRAMES;
+        __sync_synchronize();
+        s_rd = rp + take;
+    }
 }
 
 static void audio_thread_entry(void *arg)
@@ -99,10 +159,24 @@ static void audio_thread_entry(void *arg)
     sysThreadExit(0);
 }
 
+static inline int32_t soft_clip16(int32_t x)
+{
+    if (x > 24576) {
+        x = 24576 + ((x - 24576) >> 2);
+        if (x > 32767) x = 32767;
+    } else if (x < -24576) {
+        x = -24576 + ((x + 24576) >> 2);
+        if (x < -32768) x = -32768;
+    }
+    return x;
+}
+
 void ps3_audio_push_frame(int frames)
 {
     static int16_t psg_stereo[SND_PUSH_MAX * 2];
     static int16_t cdda_stereo[SND_PUSH_MAX * 2];
+    static int32_t s_lp_l = 0;
+    static int32_t s_lp_r = 0;
     unsigned wp, used;
     int total;
 
@@ -111,15 +185,23 @@ void ps3_audio_push_frame(int frames)
     static int s_was_ff = 0;
     if (g_fast_forward_active) {
         s_was_ff = 1;
+        CycleOld = CycleNew;
         for (int ch = 0; ch < 6; ch++) {
             io.psg_da_count[ch] = 0;
             io.psg_da_index[ch] = 0;
+        }
+        if (adpcmbuf && io.adpcm_psize > 0) {
+            dwNewPos = (UInt32)(PS3_AUDIO_RATE / 60);
+            write_adpcm();
         }
         return;
     }
     if (s_was_ff) {
         s_was_ff = 0;
         s_rd = s_wr;
+        s_primed = 0;
+        s_frac_fp = 0;
+        CycleOld = CycleNew;
         for (int ch = 0; ch < 6; ch++) {
             io.psg_da_count[ch] = 0;
             io.psg_da_index[ch] = 0;
@@ -137,6 +219,8 @@ void ps3_audio_push_frame(int frames)
             WriteBuffer((char *)sbuf[ch], ch, byte_len);
         }
     }
+    dwNewPos = (UInt32)total;
+    CycleOld = CycleNew;
     if (adpcmbuf) {
         write_adpcm();
     }
@@ -151,20 +235,19 @@ void ps3_audio_push_frame(int frames)
     for (int k = 0; k < total; k++) {
         size_t li = (size_t)k * 2;
         size_t ri = (size_t)k * 2 + 1;
+        int32_t adpcm_v = ((int32_t)(int8_t)adpcmbuf[k] * 3) >> 1;
         int32_t sum_l = (int8_t)sbuf[0][li] + (int8_t)sbuf[1][li] + (int8_t)sbuf[2][li] +
                         (int8_t)sbuf[3][li] + (int8_t)sbuf[4][li] + (int8_t)sbuf[5][li] +
-                        (int8_t)adpcmbuf[li];
+                        adpcm_v;
         int32_t sum_r = (int8_t)sbuf[0][ri] + (int8_t)sbuf[1][ri] + (int8_t)sbuf[2][ri] +
                         (int8_t)sbuf[3][ri] + (int8_t)sbuf[4][ri] + (int8_t)sbuf[5][ri] +
-                        (int8_t)adpcmbuf[ri];
-        int32_t sl = (sum_l * (lvol + 1) * 5) / 2;
-        int32_t sr = (sum_r * (rvol + 1) * 5) / 2;
-        if (sl >  32767) sl =  32767;
-        if (sl < -32768) sl = -32768;
-        if (sr >  32767) sr =  32767;
-        if (sr < -32768) sr = -32768;
-        psg_stereo[li] = (int16_t)sl;
-        psg_stereo[ri] = (int16_t)sr;
+                        adpcm_v;
+        int32_t sl = (sum_l * (lvol + 1) * 9) >> 2;
+        int32_t sr = (sum_r * (rvol + 1) * 9) >> 2;
+        s_lp_l = (sl * 3 + s_lp_l) >> 2;
+        s_lp_r = (sr * 3 + s_lp_r) >> 2;
+        psg_stereo[li] = (int16_t)soft_clip16(s_lp_l);
+        psg_stereo[ri] = (int16_t)soft_clip16(s_lp_r);
     }
 
     memset(cdda_stereo, 0, (size_t)total * 2 * sizeof(int16_t));
@@ -185,12 +268,8 @@ void ps3_audio_push_frame(int frames)
     if (total <= 0) return;
 
     for (int k = 0; k < total; k++) {
-        int32_t l = (int32_t)psg_stereo[k * 2 + 0] + (int32_t)cdda_stereo[k * 2 + 0];
-        int32_t r = (int32_t)psg_stereo[k * 2 + 1] + (int32_t)cdda_stereo[k * 2 + 1];
-        if (l >  32767) l =  32767;
-        if (l < -32768) l = -32768;
-        if (r >  32767) r =  32767;
-        if (r < -32768) r = -32768;
+        int32_t l = soft_clip16((int32_t)psg_stereo[k * 2 + 0] + (int32_t)cdda_stereo[k * 2 + 0]);
+        int32_t r = soft_clip16((int32_t)psg_stereo[k * 2 + 1] + (int32_t)cdda_stereo[k * 2 + 1]);
         l = (l * vol) / 100;
         r = (r * vol) / 100;
         {
@@ -223,6 +302,8 @@ int ps3_audio_init(void)
     memset(s_ring, 0, sizeof(s_ring));
     s_wr = 0;
     s_rd = 0;
+    s_primed = 0;
+    s_frac_fp = 0;
     s_stopped = 1;
 
     if (audioInit() != 0) {
@@ -307,6 +388,8 @@ void ps3_audio_pause(int paused)
         s_stopped = 1;
     } else {
         s_rd = s_wr;
+        s_primed = 0;
+        s_frac_fp = 0;
         s_stopped = 0;
     }
 }

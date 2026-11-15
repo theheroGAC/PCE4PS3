@@ -6,7 +6,7 @@
 #include "ps3_btn_icons.h"
 
 #define PS3_APP_NAME        "PCE-PS3"
-#define PS3_APP_VERSION     "1.02"
+#define PS3_APP_VERSION     "1.03"
 #define PS3_TITLE_ID        "PCE4PS300"
 
 #define PS3_DATA_ROOT       "/dev_hdd0/pce4ps3"
@@ -123,6 +123,7 @@ typedef struct {
     int map_select;
     int map_fastforward;
     int fast_forward_speed;
+    int auto_scan_startup;
     char bios_name[256];
     char last_rom_dir[512];
 } ps3_config_t;
@@ -133,6 +134,7 @@ extern int ROM_size;
 extern char g_rom_base[256];
 extern char g_active_rom_path[512];
 extern volatile int g_fast_forward_active;
+extern int g_ps3_ff_skip_draw;
 const char *ps3_btn_name(int btn_id);
 int  ps3_load_rom_preview(const char *rom_base, const char *full_path, uint32_t *out_argb, int dst_w, int dst_h);
 void ps3_save_rom_preview(const char *rom_base);
@@ -143,6 +145,7 @@ void ps3_log_close(void);
 void ps3_log(const char *fmt, ...);
 
 void ps3_ensure_directories(void);
+int  ps3_score_syscard_file(const char *path, int strict_dir);
 int  ps3_find_syscard(char *out_path, size_t cap);
 
 void ps3_config_defaults(void);
@@ -230,11 +233,18 @@ int  ps3_state_delete(int slot);
 int  ps3_state_load_thumb(int slot, uint32_t *out_argb);
 
 int  ps3_cue_load(const char *cue_path);
+int  ps3_cd_open_image(const char *img_path);
 void ps3_cue_unload(void);
 int  ps3_cue_is_loaded(void);
 void ps3_cue_read_sector(unsigned char *buf, uint32_t lba);
+void ps3_cue_read_sectors(unsigned char *buf, uint32_t lba, uint32_t count);
 int  ps3_cue_play_cdda_track(unsigned char track, int repeat);
+int  ps3_cue_play_cdda_range(int m1, int s1, int f1, int m2, int s2, int f2, int repeat);
 void ps3_cue_stop_cdda(void);
+void ps3_cue_pause_cdda(int pause);
+int  ps3_cue_get_cdda_status(void);
+void ps3_cue_get_disc_length(int *m, int *s, int *f);
+void ps3_cue_get_subchannel_info(uint8_t out_subq[10]);
 void ps3_cue_mix_cdda(int16_t *stereo_accum, size_t frames);
 
 #endif

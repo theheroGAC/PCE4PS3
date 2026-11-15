@@ -30,6 +30,7 @@ void ps3_config_defaults(void)
     g_cfg.map_select      = PS3_BTN_SELECT;
     g_cfg.map_fastforward = PS3_BTN_L3;
     g_cfg.fast_forward_speed = 3;
+    g_cfg.auto_scan_startup = 1;
     snprintf(g_cfg.bios_name, sizeof(g_cfg.bios_name), "syscard3.pce");
     snprintf(g_cfg.last_rom_dir, sizeof(g_cfg.last_rom_dir), "%s", PS3_ROMS_DIR);
 }
@@ -105,6 +106,7 @@ void ps3_config_load(void)
         else if (!strcasecmp(key, "map_select"))      g_cfg.map_select      = atoi(val) % PS3_BTN_MAX;
         else if (!strcasecmp(key, "map_fastforward")) g_cfg.map_fastforward = atoi(val) % PS3_BTN_MAX;
         else if (!strcasecmp(key, "fast_forward_speed")) g_cfg.fast_forward_speed = atoi(val);
+        else if (!strcasecmp(key, "auto_scan_startup"))  g_cfg.auto_scan_startup  = atoi(val) ? 1 : 0;
         else if (!strcasecmp(key, "bios_name"))    snprintf(g_cfg.bios_name, sizeof(g_cfg.bios_name), "%s", val);
         else if (!strcasecmp(key, "last_rom_dir")) snprintf(g_cfg.last_rom_dir, sizeof(g_cfg.last_rom_dir), "%s", val);
     }
@@ -142,6 +144,7 @@ void ps3_config_save(void)
     fprintf(f, "map_select=%d\n",      g_cfg.map_select);
     fprintf(f, "map_fastforward=%d\n", g_cfg.map_fastforward);
     fprintf(f, "fast_forward_speed=%d\n", g_cfg.fast_forward_speed);
+    fprintf(f, "auto_scan_startup=%d\n",  g_cfg.auto_scan_startup);
     fprintf(f, "bios_name=%s\n",    g_cfg.bios_name);
     fprintf(f, "last_rom_dir=%s\n", g_cfg.last_rom_dir);
     fclose(f);

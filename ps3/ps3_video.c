@@ -34,9 +34,24 @@ static int g_last_game_h = 224;
 
 static SDL_Texture *g_game_tex = NULL;
 static uint32_t    *g_game_argb = NULL;
-static uint32_t    *g_game_up = NULL;
 static int          g_game_argb_w = 0;
 static int          g_game_argb_h = 0;
+
+static int          g_rsx_hw_linear = 0;
+static int          g_native_clear_frames = 3;
+static int          g_native_prev_aspect = -1;
+static int          g_native_prev_sw = 0;
+static int          g_native_prev_sh = 0;
+
+extern void __real_rsxSetTransferScaleSurface(void *context, void *scale, void *surface);
+
+void __wrap_rsxSetTransferScaleSurface(void *context, void *scale, void *surface)
+{
+    if (scale) {
+        ((uint8_t *)scale)[43] = (g_rsx_hw_linear != 0) ? 1u : 0u;
+    }
+    __real_rsxSetTransferScaleSurface(context, scale, surface);
+}
 
 static void create_screen_texture(void);
 
@@ -292,14 +307,15 @@ void ps3_video_shutdown(void)
     if (g_screen_tex) { SDL_DestroyTexture(g_screen_tex); g_screen_tex = NULL; }
     if (g_game_tex)   { SDL_DestroyTexture(g_game_tex);   g_game_tex = NULL; }
     if (g_game_argb)  { free(g_game_argb); g_game_argb = NULL; }
-    if (g_game_up)    { free(g_game_up);   g_game_up = NULL; }
     g_game_argb_w = 0;
     g_game_argb_h = 0;
     if (g_renderer)   { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
     if (g_window)     { SDL_DestroyWindow(g_window); g_window = NULL; }
     if (g_screen_fb)  { free(g_screen_fb); g_screen_fb = NULL; }
     SDL_Quit();
-}static void create_screen_texture(void)
+}
+
+static void create_screen_texture(void)
 {
     if (!g_renderer) return;
     if (g_screen_tex) { SDL_DestroyTexture(g_screen_tex); g_screen_tex = NULL; }
@@ -317,12 +333,8 @@ void ps3_video_shutdown(void)
 
 void ps3_video_apply_filter(void)
 {
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
-    if (!g_renderer) return;
-    if (g_game_tex) {
-        SDL_DestroyTexture(g_game_tex);
-        g_game_tex = NULL;
-    }
+    g_rsx_hw_linear = (g_cfg.filter != PS3_FILTER_NEAREST) ? 1 : 0;
+    g_native_clear_frames = 3;
 }
 
 void ps3_video_set_palette_entry(unsigned char idx,
@@ -346,6 +358,7 @@ void ps3_video_clear(uint8_t r, uint8_t g, uint8_t b)
     s_prev_off_y = -1;
     s_prev_dst_w = -1;
     s_prev_dst_h = -1;
+    g_native_clear_frames = 3;
     uint32_t px = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
     size_t total = (size_t)PS3_SCREEN_W * PS3_SCREEN_H;
     for (size_t i = 0; i < total; i++) {
@@ -358,6 +371,8 @@ void ps3_video_present(void)
     SDL_Rect dst;
     if (!g_renderer || !g_screen_tex || !g_screen_fb) return;
 
+    g_rsx_hw_linear = (g_out_w != PS3_SCREEN_W || g_out_h != PS3_SCREEN_H) ? 1 : 0;
+    g_native_clear_frames = 3;
     dst.x = 0;
     dst.y = 0;
     dst.w = g_out_w;
@@ -1310,11 +1325,85 @@ void ps3_video_render_game_to_fb(int src_w, int src_h)
     }
 }
 
+static inline uint32_t swar_avg32(uint32_t a, uint32_t b)
+{
+    return (a & b) + (((a ^ b) & 0xFEFEFEFEu) >> 1);
+}
+
+static inline uint64_t swar_avg64(uint64_t a, uint64_t b)
+{
+    return (a & b) + (((a ^ b) & 0xFEFEFEFEFEFEFEFEULL) >> 1);
+}
+
+static void draw_game_overlay_pill(int x, int y, int w, int h,
+                                   int buf_w, int buf_h,
+                                   uint32_t bg_col, uint32_t border_col,
+                                   uint32_t fg_col, const char *text)
+{
+    if (!g_game_argb || w <= 4 || h <= 4) return;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > buf_w) w = buf_w - x;
+    if (y + h > buf_h) h = buf_h - y;
+    if (w <= 4 || h <= 4) return;
+
+    uint32_t brd = 0xFF000000u | (border_col & 0x00FFFFFFu);
+    uint32_t bg  = 0xFF000000u | (bg_col & 0x00FFFFFFu);
+    uint32_t fg  = 0xFF000000u | (fg_col & 0x00FFFFFFu);
+
+    for (int ry = 0; ry < h; ry++) {
+        uint32_t *row = &g_game_argb[(size_t)(y + ry) * (size_t)XBUF_WIDTH + (size_t)x];
+        if (ry == 0 || ry == h - 1) {
+            for (int rx = 0; rx < w; rx++) row[rx] = brd;
+        } else {
+            row[0] = brd;
+            for (int rx = 1; rx < w - 1; rx++) {
+                row[rx] = swar_avg32(bg, swar_avg32(bg, row[rx]));
+            }
+            row[w - 1] = brd;
+        }
+    }
+
+    if (!text || !text[0]) return;
+    int len = (int)strlen(text);
+    int max_chars = (w - 8) / 7;
+    if (max_chars < 1) return;
+    if (len > max_chars) len = max_chars;
+
+    int tw = len * 7;
+    int tx = x + (w - tw) / 2;
+    int ty = y + (h - 8) / 2;
+
+    for (int ci = 0; ci < len; ci++) {
+        unsigned char ch = (unsigned char)text[ci];
+        if (ch < 32 || ch > 127) ch = '?';
+        const uint8_t *glyph = s_font8x8[ch - 32];
+        for (int gy = 0; gy < 8; gy++) {
+            uint8_t bits = glyph[gy];
+            if (!bits) continue;
+            int dy = ty + gy;
+            if (dy <= y || dy >= y + h - 1) continue;
+            uint32_t *drow = &g_game_argb[(size_t)dy * (size_t)XBUF_WIDTH];
+            uint32_t *srow = (dy + 1 < y + h - 1) ? &g_game_argb[(size_t)(dy + 1) * (size_t)XBUF_WIDTH] : NULL;
+            for (int gx = 0; gx < 7; gx++) {
+                if (bits & (0x80u >> gx)) {
+                    int dx = tx + ci * 7 + gx;
+                    if (dx > x && dx < x + w - 1) {
+                        if (srow && dx + 1 < x + w - 1) srow[dx + 1] = 0xFF000000u;
+                        drow[dx] = fg;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static int game_present_native(int src_w, int src_h)
 {
     unsigned char *src_base = osd_gfx_buffer ? osd_gfx_buffer
                                              : (XBuf ? (XBuf + 32 + 64 * XBUF_WIDTH) : NULL);
     static uint32_t s_scan_line_pal[256];
+    SDL_Rect src;
     SDL_Rect dst;
     int dst_w = PS3_SCREEN_W;
     int dst_h = PS3_SCREEN_H;
@@ -1323,6 +1412,10 @@ static int game_present_native(int src_w, int src_h)
 
     if (src_w <= 0 || src_w > XBUF_WIDTH)  src_w = 256;
     if (src_h <= 0 || src_h > XBUF_HEIGHT) src_h = 224;
+    src_w &= ~1;
+    src_h &= ~1;
+    if (src_w < 16) src_w = 256;
+    if (src_h < 16) src_h = 224;
 
     if (!g_game_argb) {
         g_game_argb = (uint32_t *)malloc((size_t)XBUF_WIDTH * (size_t)XBUF_HEIGHT * sizeof(uint32_t));
@@ -1335,54 +1428,59 @@ static int game_present_native(int src_w, int src_h)
         for (int i = 0; i < 256; i++) s_scan_line_pal[i] = apply_scanline(g_palette_argb[i]);
     }
 
-    for (int y = 0; y < src_h; y++) {
-        const unsigned char *srow = src_base + y * XBUF_WIDTH;
-        uint32_t *drow = g_game_argb + (size_t)y * (size_t)XBUF_WIDTH;
-        if (g_cfg.scanlines && (y & 1)) {
-            for (int x = 0; x < src_w; x++) drow[x] = s_scan_line_pal[srow[x]];
-        } else {
-            for (int x = 0; x < src_w; x++) drow[x] = g_palette_argb[srow[x]];
+    if (g_cfg.filter == PS3_FILTER_ANISOTROPIC) {
+        for (int y = 0; y < src_h; y++) {
+            const unsigned char *srow = src_base + y * XBUF_WIDTH;
+            uint32_t *drow = g_game_argb + (size_t)y * (size_t)XBUF_WIDTH;
+            const uint32_t *pal = (g_cfg.scanlines && (y & 1)) ? s_scan_line_pal : g_palette_argb;
+            for (int x = 0; x < src_w - 1; x++) {
+                uint32_t c0 = pal[srow[x]];
+                uint32_t c1 = pal[srow[x + 1]];
+                drow[x] = (c0 == c1) ? c0 : swar_avg32(c0, swar_avg32(c0, c1));
+            }
+            drow[src_w - 1] = pal[srow[src_w - 1]];
+        }
+    } else {
+        for (int y = 0; y < src_h; y++) {
+            const unsigned char *srow = src_base + y * XBUF_WIDTH;
+            uint32_t *drow = g_game_argb + (size_t)y * (size_t)XBUF_WIDTH;
+            const uint32_t *pal = (g_cfg.scanlines && (y & 1)) ? s_scan_line_pal : g_palette_argb;
+            for (int x = 0; x < src_w; x++) {
+                drow[x] = pal[srow[x]];
+            }
         }
     }
 
-    if (g_fast_forward_active && src_w >= 40 && src_h >= 28) {
-        static const uint8_t ff_glyph[7][13] = {
-            {1,1,0,0,0,0,0,1,1,0,0,0,0},
-            {0,1,1,0,0,0,0,0,1,1,0,0,0},
-            {0,0,1,1,0,0,0,0,0,1,1,0,0},
-            {0,0,0,1,1,0,0,0,0,0,1,1,0},
-            {0,0,1,1,0,0,0,0,0,1,1,0,0},
-            {0,1,1,0,0,0,0,0,1,1,0,0,0},
-            {1,1,0,0,0,0,0,1,1,0,0,0,0}
-        };
-        int bx0 = src_w - 29;
-        int by0 = 8;
-        int bw = 21;
-        int bh = 13;
-        for (int dy = 0; dy < bh; dy++) {
-            uint32_t *brow = g_game_argb + (size_t)(by0 + dy) * (size_t)XBUF_WIDTH;
-            for (int dx = 0; dx < bw; dx++) {
-                if (dy == 0 || dy == bh - 1 || dx == 0 || dx == bw - 1) {
-                    brow[bx0 + dx] = 0xFFFFA800u;
-                } else {
-                    brow[bx0 + dx] = 0xFF101828u;
-                }
-            }
+    if (g_cfg.show_fps || g_fast_forward_active) {
+        char hud_str[40];
+        uint32_t cbg, cbrd, cfg;
+        int spd = (g_cfg.fast_forward_speed >= 2 && g_cfg.fast_forward_speed <= 5) ? g_cfg.fast_forward_speed : 2;
+        if (g_cfg.show_fps && g_fast_forward_active) {
+            snprintf(hud_str, sizeof(hud_str), "%.0f FPS >>%dx", g_fps_value, spd);
+            cbg = 0xFF58180Cu; cbrd = 0xFFFF6040u; cfg = 0xFFFFDD66u;
+        } else if (g_fast_forward_active) {
+            snprintf(hud_str, sizeof(hud_str), ">> FF %dx", spd);
+            cbg = 0xFF58180Cu; cbrd = 0xFFFF6040u; cfg = 0xFFFFDD66u;
+        } else {
+            snprintf(hud_str, sizeof(hud_str), "%.1f FPS", g_fps_value);
+            cbg = 0xFF0A162Au; cbrd = 0xFF3E78C0u; cfg = 0xFF7CE8FFu;
         }
-        for (int gy = 0; gy < 7; gy++) {
-            uint32_t *brow = g_game_argb + (size_t)(by0 + 3 + gy) * (size_t)XBUF_WIDTH;
-            for (int gx = 0; gx < 13; gx++) {
-                if (ff_glyph[gy][gx]) {
-                    brow[bx0 + 4 + gx] = 0xFFFFC800u;
-                }
-            }
-        }
+        int pw = (int)strlen(hud_str) * 7 + 10;
+        if (pw > src_w - 8) pw = src_w - 8;
+        draw_game_overlay_pill(src_w - pw - 4, 4, pw, 14, src_w, src_h, cbg, cbrd, cfg, hud_str);
+    }
+
+    if (g_toast_frames > 0 && g_toast_msg[0]) {
+        int tw = (int)strlen(g_toast_msg) * 7 + 12;
+        if (tw > src_w - 8) tw = src_w - 8;
+        draw_game_overlay_pill((src_w - tw) / 2, src_h - 20, tw, 14, src_w, src_h,
+                               0xFF102446u, 0xFFFF8824u, 0xFFFFFFFFu, g_toast_msg);
     }
 
     if (!g_game_tex) {
         g_game_tex = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
                                        SDL_TEXTUREACCESS_STREAMING,
-                                       XBUF_WIDTH * 2, XBUF_HEIGHT * 2);
+                                       XBUF_WIDTH, XBUF_HEIGHT);
         if (g_game_tex) SDL_SetTextureBlendMode(g_game_tex, SDL_BLENDMODE_NONE);
     }
     if (!g_game_tex) return -1;
@@ -1404,64 +1502,31 @@ static int game_present_native(int src_w, int src_h)
     dst.y = (g_out_h * ((PS3_SCREEN_H - dst_h) / 2)) / PS3_SCREEN_H;
     dst.w = (g_out_w * dst_w) / PS3_SCREEN_W;
     dst.h = (g_out_h * dst_h) / PS3_SCREEN_H;
+    dst.w &= ~1;
+    dst.h &= ~1;
 
-    SDL_Rect src;
+    if (g_native_prev_aspect != g_cfg.aspect ||
+        g_native_prev_sw != src_w ||
+        g_native_prev_sh != src_h) {
+        g_native_clear_frames = 3;
+        g_native_prev_aspect = g_cfg.aspect;
+        g_native_prev_sw     = src_w;
+        g_native_prev_sh     = src_h;
+    }
+
+    if (g_native_clear_frames > 0) {
+        SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(g_renderer);
+        g_native_clear_frames--;
+    }
+
+    g_rsx_hw_linear = (g_cfg.filter != PS3_FILTER_NEAREST) ? 1 : 0;
+
     src.x = 0;
     src.y = 0;
     src.w = src_w;
     src.h = src_h;
 
-    if (g_cfg.filter != PS3_FILTER_NEAREST && !g_fast_forward_active) {
-        int uw = src_w * 2;
-        int uh = src_h * 2;
-        if (!g_game_up) {
-            g_game_up = (uint32_t *)malloc((size_t)XBUF_WIDTH * 2 * (size_t)XBUF_HEIGHT * 2 * sizeof(uint32_t));
-        }
-        if (g_game_up) {
-            for (int y = 0; y < uh; y++) {
-                int sy = y >> 1;
-                const uint32_t *r0 = g_game_argb + (size_t)sy * (size_t)XBUF_WIDTH;
-                const uint32_t *r1 = (sy + 1 < src_h) ? (r0 + XBUF_WIDTH) : r0;
-                uint32_t *d = g_game_up + (size_t)y * (size_t)uw;
-
-                if (g_cfg.filter == PS3_FILTER_ANISOTROPIC) {
-                    for (int x = 0; x < uw; x++) {
-                        int sx = x >> 1;
-                        if (x & 1) {
-                            uint32_t c1 = r0[(sx + 1 < src_w) ? sx + 1 : sx];
-                            d[x] = fast_blend(r0[sx], c1, 96u);
-                        } else {
-                            d[x] = r0[sx];
-                        }
-                    }
-                } else {
-                    uint32_t wy = (y & 1) ? 128u : 0u;
-                    for (int x = 0; x < uw; x++) {
-                        int sx = x >> 1;
-                        int sx1 = (sx + 1 < src_w) ? sx + 1 : sx;
-                        uint32_t fx = (x & 1) ? 128u : 0u;
-                        uint32_t top = fast_blend(r0[sx], r0[sx1], fx);
-                        uint32_t bot = fast_blend(r1[sx], r1[sx1], fx);
-                        d[x] = fast_blend(top, bot, wy);
-                    }
-                }
-            }
-
-            src.w = uw;
-            src.h = uh;
-
-            SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-            SDL_RenderClear(g_renderer);
-            SDL_UpdateTexture(g_game_tex, &src, g_game_up, uw * (int)sizeof(uint32_t));
-            SDL_RenderCopy(g_renderer, g_game_tex, &src, &dst);
-            SDL_RenderPresent(g_renderer);
-            ps3_check_sysutil();
-            return 0;
-        }
-    }
-
-    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-    SDL_RenderClear(g_renderer);
     SDL_UpdateTexture(g_game_tex, &src, g_game_argb, XBUF_WIDTH * (int)sizeof(uint32_t));
     SDL_RenderCopy(g_renderer, g_game_tex, &src, &dst);
     SDL_RenderPresent(g_renderer);
@@ -1475,29 +1540,31 @@ void ps3_video_present_game_frame(int src_w, int src_h)
 
     if (!g_screen_fb) return;
 
-    fast_path = (g_cfg.show_fps == 0 && g_toast_frames <= 0 &&
-                 !g_take_screenshot_pending);
-
-    if (fast_path) {
-        g_last_game_w = src_w;
-        g_last_game_h = src_h;
-        if (game_present_native(src_w, src_h) != 0) {
-            ps3_video_render_game_to_fb(src_w, src_h);
-            fast_path = 0;
-        }
-    } else {
-        ps3_video_render_game_to_fb(src_w, src_h);
-    }
-
-    g_fps_counter++;
+    int spd = (g_fast_forward_active && g_cfg.fast_forward_speed >= 2) ? g_cfg.fast_forward_speed : 1;
+    g_fps_counter += spd;
     uint64_t t = now_us();
     if (g_fps_last_us == 0) {
         g_fps_last_us = t;
     } else if (t - g_fps_last_us >= 500000ULL) {
         g_fps_value = (float)g_fps_counter * 1000000.0f / (float)(t - g_fps_last_us);
+        if (g_fps_value > 999.0f) g_fps_value = 999.0f;
         g_fps_counter = 0;
         g_fps_last_us = t;
     }
+
+    fast_path = !g_take_screenshot_pending;
+
+    if (fast_path) {
+        g_last_game_w = src_w;
+        g_last_game_h = src_h;
+        if (game_present_native(src_w, src_h) == 0) {
+            if (g_toast_frames > 0) g_toast_frames--;
+            return;
+        }
+        fast_path = 0;
+    }
+
+    ps3_video_render_game_to_fb(src_w, src_h);
 
     if (g_cfg.show_fps) {
         char fps_buf[32];
@@ -1524,7 +1591,7 @@ void ps3_video_present_game_frame(int src_w, int src_h)
         g_toast_frames--;
     }
 
-    if (!fast_path) ps3_video_present();
+    ps3_video_present();
 }
 
 static void save_bmp_file(const char *path, const uint32_t *pixels, int w, int h)
